@@ -214,6 +214,7 @@ static llvm::cl::opt<EmissionTargetType, true> emissionTargetOpt(
             "Lower the input to MLIR built-in transformation dialect."),
         clEnumVal(
             EmitLLVMIR, "Lower the input to LLVM IR (LLVM MLIR dialect)."),
+        clEnumVal(EmitSPIRV, "Lower the input to SPIRV (SPIRV MLIR dialect)."),
         clEnumVal(EmitObj, "Compile the input into a object file."),
         clEnumVal(
             EmitLib, "Compile the input into a shared library (default)."),

@@ -95,6 +95,12 @@ add_onnx_mlir_library(OMCompilerPasses
   MLIRBuiltinToLLVMIRTranslation
   MLIROpenMPToLLVM
   MLIRSCFToOpenMP
+  MLIRMemRefToSPIRV
+  MLIRAffineToStandard
+  MLIRSCFToControlFlow
+  MLIRControlFlowToSPIRV
+  MLIRSCFToSPIRV
+  MLIRArithToSPIRV
   )
 
 # ONNX_MLIR_PRODUCT_VERSION is specified/cached.

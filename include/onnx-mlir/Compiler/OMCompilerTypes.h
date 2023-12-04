@@ -29,6 +29,7 @@ typedef enum {
   EmitObj,
   EmitLib,
   EmitJNI,
+  EmitSPIRV,
 } EmissionTargetType;
 
 /* Input IR can be at one of these levels */

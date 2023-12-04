@@ -317,6 +317,8 @@ std::string getTargetFilename(
 
   case EmitJNI:
     return filenameNoExt + ".jar";
+  case EmitSPIRV:
+    return filenameNoExt + ".spirv.mlir";
   case EmitLLVMIR:
   case EmitONNXBasic:
   case EmitONNXIR:

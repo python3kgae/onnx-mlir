@@ -294,6 +294,16 @@ void addPasses(mlir::OwningOpRef<ModuleOp> &module, mlir::PassManager &pm,
       addKrnlToAffinePasses(pm);
   }
 
+  if (emissionTarget == EmitSPIRV) {
+    pm.addPass(mlir::createLowerAffinePass());
+    pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
+    pm.addPass(mlir::createConvertSCFToCFPass());
+    pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
+    pm.addPass(mlir::createConvertControlFlowToSPIRVPass());
+    pm.addPass(mlir::createConvertMemRefToSPIRVPass());
+    return;
+  }
+
   if (inputIRLevel <= LLVMLevel && emissionTarget >= EmitLLVMIR)
     addKrnlToLLVMPasses(pm, outputNameNoExt, /*enableCSE=*/true);
 }
