@@ -22,6 +22,9 @@
 namespace mlir {
 class MLIRContext;
 class Pass;
+class ModuleOp;
+template <typename T>
+class OperationPass;
 } // namespace mlir
 
 namespace onnx_mlir {
@@ -118,6 +121,15 @@ std::unique_ptr<mlir::Pass> createConvertKrnlToLLVMPass(bool verifyInputTensors,
     bool useOpaquePointer, bool useLRODATA, bool storeConstantsToFile,
     float constantsToFileSingleThreshold, float constantsToFileTotalThreshold,
     std::string outputNameNoExt, bool enableParallel);
+
+/// Pass for lowering Krnl dialect to SPIRV dialect.
+std::unique_ptr<mlir::Pass> createConvertKrnlToSPIRVPass();
+std::unique_ptr<mlir::Pass> createConvertKrnlToSPIRVPass(bool verifyInputTensors,
+    bool useOpaquePointer, bool useLRODATA, bool storeConstantsToFile,
+    float constantsToFileSingleThreshold, float constantsToFileTotalThreshold,
+    std::string outputNameNoExt, bool enableParallel);
+
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createConvertKrnlEntryToGPUPass();
 
 } // namespace krnl
 

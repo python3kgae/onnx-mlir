@@ -25,6 +25,8 @@ void addONNXToKrnlPasses(mlir::PassManager &pm, int optLevel, bool enableCSE,
 void addKrnlToAffinePasses(mlir::PassManager &pm);
 void addKrnlToLLVMPasses(
     mlir::OpPassManager &pm, std::string outputNameNoExt, bool enableCSE);
+void addKrnlToSPIRVPasses(
+    mlir::OpPassManager &pm, std::string outputNameNoExt, bool enableCSE);
 InputIRLevelType determineInputIRLevel(
     mlir::OwningOpRef<mlir::ModuleOp> &module);
 void addPasses(mlir::OwningOpRef<mlir::ModuleOp> &module, mlir::PassManager &pm,
