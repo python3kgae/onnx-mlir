@@ -47,7 +47,7 @@ public:
 
     // Check whether all indices are affine maps or not.
     bool affineIndices =
-        !llvm::any_of(indices, [](Value v) { return !affine::isValidDim(v); });
+        !llvm::any_of(indices, [](Value v) { return !affine::isValidDim(v); }) && !indices.empty();
 
     if (affineIndices)
       rewriter.replaceOpWithNewOp<affine::AffineLoadOp>(op, memref, indices);

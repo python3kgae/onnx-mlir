@@ -261,14 +261,18 @@ void addKrnlToSPIRVPasses(
     // TODO: enable this by default when we make sure it works flawlessly.
     pm.addPass(mlir::createCSEPass());
   pm.addNestedPass<func::FuncOp>(mlir::createConvertVectorToSCFPass());
+  //pm.addNestedPass<func::FuncOp>(mlir::createAffineForToGPUPass());
 
   pm.addPass(onnx_mlir::krnl::createConvertKrnlEntryToGPUPass());
-  pm.addPass(mlir::createLowerAffinePass());
-  pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
-  pm.addPass(mlir::createConvertSCFToCFPass());
-  pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
-  pm.addPass(mlir::createConvertControlFlowToSPIRVPass());
-  pm.addPass(mlir::createConvertMemRefToSPIRVPass());
+  pm.addPass(mlir::createMem2Reg());
+ // pm.addPass(mlir::createLowerAffinePass());
+ // pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
+ // pm.addPass(mlir::createConvertSCFToCFPass());
+  //pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
+  //pm.addPass(mlir::createConvertControlFlowToSPIRVPass());
+  //pm.addPass(mlir::createConvertMemRefToSPIRVPass());
+  pm.addPass(mlir::createConvertGPUToSPIRVPass());
+  return;
 
   // Early introduction of omp causes problems with bufferization, delay for
   // now. May revise this decision later.
