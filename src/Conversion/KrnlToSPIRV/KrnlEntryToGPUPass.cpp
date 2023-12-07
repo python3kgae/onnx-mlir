@@ -19,6 +19,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVEnums.h"
 
 #include "src/Pass/Passes.hpp"
 #include "mlir/Pass/Pass.h"
@@ -565,6 +566,23 @@ spirv::EntryPointABIAttr entryPointInfo =
 
 outlinedFunc->setAttr(spirv::getEntryPointABIAttrName(), entryPointInfo);
   }
+
+  spirv::TargetEnvAttr targetAttr = spirv::lookupTargetEnvOrDefault(module);
+
+  // Add SPV_KHR_storage_buffer_storage_class, SPV_KHR_variable_pointers to
+  // targetAttr.
+  auto triple = spirv::VerCapExtAttr::get(spirv::Version::V_1_3,
+      {spirv::Capability::Shader},
+      {spirv::Extension::SPV_KHR_storage_buffer_storage_class,
+          spirv::Extension::SPV_KHR_variable_pointers},
+      context);
+  targetAttr = spirv::TargetEnvAttr::get(triple,
+      spirv::getDefaultResourceLimits(context), spirv::ClientAPI::Unknown,
+      spirv::Vendor::Unknown, spirv::DeviceType::Unknown,
+      spirv::TargetEnvAttr::kUnknownDeviceID);
+
+  module->setAttr(spirv::getTargetEnvAttrName(), targetAttr);
+
 
   TypeConverter typeConverter = TypeConverter();
   RewritePatternSet patterns(context);

@@ -103,6 +103,7 @@ add_onnx_mlir_library(OMCompilerPasses
   MLIRArithToSPIRV
   MLIRSCFToGPU
   MLIRGPUToSPIRV
+  MLIRSPIRVTransforms
   )
 
 # ONNX_MLIR_PRODUCT_VERSION is specified/cached.

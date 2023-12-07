@@ -25,6 +25,8 @@
 #include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+#include "mlir/Dialect/SPIRV/Transforms/Passes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/Passes.h"
@@ -264,14 +266,21 @@ void addKrnlToSPIRVPasses(
   //pm.addNestedPass<func::FuncOp>(mlir::createAffineForToGPUPass());
 
   pm.addPass(onnx_mlir::krnl::createConvertKrnlEntryToGPUPass());
+
   pm.addPass(mlir::createMem2Reg());
- // pm.addPass(mlir::createLowerAffinePass());
- // pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
- // pm.addPass(mlir::createConvertSCFToCFPass());
-  //pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
-  //pm.addPass(mlir::createConvertControlFlowToSPIRVPass());
-  //pm.addPass(mlir::createConvertMemRefToSPIRVPass());
+  pm.addPass(mlir::createLowerAffinePass());
+  pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
+  pm.addPass(mlir::createSCFToSPIRV());
+  pm.addPass(mlir::createConvertSCFToCFPass());
+  pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
+  pm.addPass(mlir::createConvertControlFlowToSPIRVPass());
+  pm.addPass(mlir::createConvertMemRefToSPIRVPass());
   pm.addPass(mlir::createConvertGPUToSPIRVPass());
+
+  OpPassManager &modulePM = pm.nest<spirv::ModuleOp>();
+  modulePM.addPass(mlir::spirv::createSPIRVLowerABIAttributesPass());
+  modulePM.addPass(mlir::spirv::createSPIRVUpdateVCEPass());
+
   return;
 
   // Early introduction of omp causes problems with bufferization, delay for
