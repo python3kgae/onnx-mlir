@@ -180,6 +180,8 @@ add_onnx_mlir_library(OMCompilerUtils
   OMAccelerator
   OMVersion
 
+  MLIRSPIRVSerialization
+
   # Link LLVM libraries necessary to query which target architectures
   # are configured.
   LINK_COMPONENTS PRIVATE

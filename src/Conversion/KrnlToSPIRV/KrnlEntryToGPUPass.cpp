@@ -488,28 +488,14 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
   // Remove krnl.entry_point.
   entryPointOp.erase();
 
+  // replace uses of entryPointFunc arguments with outlinedFunc arguments.
    for (unsigned i = 0; i < numInputs; ++i) {
      auto arg = entryPointFunc.getArgument(i);
      auto newArg = outlinedFunc.getArgument(i);
      arg.replaceAllUsesWith(newArg);
-     //entryPointFunc.getArgAttr(i);
-     //outlinedFunc.setArgAttr(
-     //    i, "gpu_name", builder.getStringAttr(entryPointFunc));
    }
 
-  for (auto arg : outlinedFunc.getArguments()) {
-    // arg->setName("gpu_" + arg.getName().str());
-    arg.dump();
-  }
-
-  for (auto arg : entryPointFunc.getArguments()) {
-    // arg->setName("gpu_" + arg.getName().str());
-    arg.dump();
-  }
-
-  //outlinedFunc.getBlocks().clear();
   // Move blocks of entryPointFunc to outlinedFunc.
-  //outlinedFunc.getFunctionBody().getBlocks().clear();
   auto &outlinedRegion = outlinedFunc.getFunctionBody();
   outlinedRegion.getBlocks().splice(
       outlinedRegion.end(), entryPointFunc.getBody().getBlocks());
@@ -521,28 +507,6 @@ entryBlock.getOperations().splice(entryBlock.end(),
                                       nextBlock.getOperations());
     nextBlock.dropAllReferences();
 nextBlock.erase();
-  // replace uses of entryPointFunc arguments with outlinedFunc arguments.
-
-  for (auto arg : outlinedFunc.getArguments()) {
-    //arg->setName("gpu_" + arg.getName().str());
-    arg.dump();
-  }
-
-  for (auto arg : entryPointFunc.getArguments()) {
-    //arg->setName("gpu_" + arg.getName().str());
-    arg.dump();
-  }
-
-  // create a range from 0 to numInputs
-  //for (int i = 0; i < numInputs; ++i) {
-  //  auto arg = entryPointFunc.getArgument(i);
-  //  auto newArg = outlinedFunc.getArgument(i);
-  //  arg.replaceAllUsesWith(newArg);
-  //}
-
-  //for (Type ty : entryPointFunc.getResultTypes()) {
-  //  kernelOperandTypes.push_back(ty);
-  //}
 
   // Find return op and remove it.
 auto returnOp = cast<func::ReturnOp>(outlinedFunc.getBody().back().getTerminator());
@@ -582,16 +546,6 @@ outlinedFunc->setAttr(spirv::getEntryPointABIAttrName(), entryPointInfo);
       spirv::TargetEnvAttr::kUnknownDeviceID);
 
   module->setAttr(spirv::getTargetEnvAttrName(), targetAttr);
-
-
-  TypeConverter typeConverter = TypeConverter();
-  RewritePatternSet patterns(context);
-  populateKrnlEntryToGPUPatterns(typeConverter, patterns);
-  // populateBuiltinFuncToSPIRVPatterns(typeConverter, patterns);
-  ConversionTarget target(getContext());
-
-  //if (failed(applyPartialConversion(module, target, std::move(patterns))))
-  //  return signalPassFailure();
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>

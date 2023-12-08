@@ -282,47 +282,6 @@ void addKrnlToSPIRVPasses(
   modulePM.addPass(mlir::spirv::createSPIRVUpdateVCEPass());
 
   return;
-
-  // Early introduction of omp causes problems with bufferization, delay for
-  // now. May revise this decision later.
-
-  // After affine is lowered, KrnlRegion for affine scope can be removed.
-  pm.addNestedPass<func::FuncOp>(krnl::createLowerKrnlRegionPass());
-
-  // Hoist allocations out of loop nests to avoid stack overflow.
-  pm.addPass(bufferization::createBufferLoopHoistingPass());
-
-  // Use MLIR buffer deallocation pass to emit buffer deallocs.
-  // Currently this has to be done *after* lowering the affine dialect because
-  // operations in that dialect do not conform to the requirements explained
-  // in https://mlir.llvm.org/docs/BufferDeallocationInternals.
-  bufferization::BufferDeallocationPipelineOptions bufferDeallocOptions;
-  mlir::bufferization::buildBufferDeallocationPipeline(
-      pm, bufferDeallocOptions);
-
-  pm.addPass(mlir::createBufferizationToMemRefPass());
-
-  // Late introduction of OpenMP, after bufferization.
-  if (enableParallel) {
-    pm.addPass(mlir::createConvertSCFToOpenMPPass());
-    pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-  }
-
-  // The pass below is needed for subview and collapseShape.. Unfortunately,
-  // MLIR supports only collapse for scalar loaded by scalar memory at this
-  // time. Uncomment if subview/collapse are used.
-  // pm.addNestedPass<func::FuncOp>(krnl::createConvertSeqToMemrefPass());
-  pm.addNestedPass<func::FuncOp>(mlir::createConvertSCFToCFPass());
-
-  pm.addPass(mlir::memref::createFoldMemRefAliasOpsPass());
-  pm.addPass(krnl::createConvertKrnlToLLVMPass(verifyInputTensors,
-      /*useOpaquePointers=*/true,
-      /*useLRODATA=*/(modelSize == ModelSize::large),
-      /*storeConstantsToFile=*/storeConstantsToFile,
-      constantsToFileSingleThreshold, constantsToFileTotalThreshold,
-      outputNameNoExt, enableParallel));
-  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-  pm.addPass(mlir::createCanonicalizerPass());
 }
 
 InputIRLevelType determineInputIRLevel(mlir::OwningOpRef<ModuleOp> &module) {

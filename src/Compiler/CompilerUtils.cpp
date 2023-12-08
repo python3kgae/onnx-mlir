@@ -16,6 +16,8 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+#include "mlir/Target/SPIRV/Serialization.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
@@ -587,6 +589,33 @@ static int compileModuleToJniJar(
   return genJniJar(module, modelSharedLibPath, modelJniJarPath);
 }
 
+// Return 0 on success, error code on failure
+static int serilizeSPIRV(
+    const mlir::OwningOpRef<ModuleOp> &module, std::string outputNameNoExt) {
+  bool done = false;
+  SmallVector<uint32_t, 0> binary;
+
+  for (auto spirvModule : module.get().getOps<mlir::spirv::ModuleOp>()) {
+    if (done) {
+      spirvModule.emitError("should only contain one 'spirv.module' op");
+      return 1;
+    }
+    done = true;
+
+    if (failed(spirv::serialize(spirvModule, binary)))
+      return 1;
+  }
+  std::vector<char> binaryShader;
+  binaryShader.resize(binary.size() * sizeof(uint32_t));
+  std::memcpy(binaryShader.data(), reinterpret_cast<char *>(binary.data()),
+      binaryShader.size());
+  std::string spirvNameWithExt = outputNameNoExt + ".spv";
+  std::ofstream ofs(spirvNameWithExt, std::ios::binary);
+  ofs.write(binaryShader.data(), binaryShader.size());
+  ofs.close();
+  return 0;
+}
+
 void loadDialects(mlir::MLIRContext &context) {
   context.appendDialectRegistry(registerDialects(maccel));
   context.loadAllAvailableDialects();
@@ -738,6 +767,19 @@ static int emitOutputFiles(std::string outputNameNoExt,
     if (VerboseOutput)
       printf(
           "JNI archive %s.jar has been compiled.\n", outputNameNoExt.c_str());
+  } break;
+  case EmitSPIRV: {
+    int rc = serilizeSPIRV(module, outputNameNoExt);
+    if (rc != CompilerSuccess)
+      return rc;
+    if (keepFiles(KeepFilesOfType::MLIR)) {
+      rc = outputCode(module, outputNameNoExt + ".spv.mlir");
+      if (rc != CompilerSuccess)
+        return rc;
+    }
+    if (VerboseOutput)
+      printf(
+          "%s.spv has been generated.\n", outputNameNoExt.c_str());
   } break;
   default: {
     // Emit the version with all constants included.
