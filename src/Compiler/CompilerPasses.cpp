@@ -269,12 +269,6 @@ void addKrnlToSPIRVPasses(
 
   pm.addPass(mlir::createMem2Reg());
   pm.addPass(mlir::createLowerAffinePass());
-  pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
-  pm.addPass(mlir::createSCFToSPIRV());
-  pm.addPass(mlir::createConvertSCFToCFPass());
-  pm.addPass(mlir::arith::createConvertArithToSPIRVPass());
-  pm.addPass(mlir::createConvertControlFlowToSPIRVPass());
-  pm.addPass(mlir::createConvertMemRefToSPIRVPass());
   pm.addPass(mlir::createConvertGPUToSPIRVPass());
 
   OpPassManager &modulePM = pm.nest<spirv::ModuleOp>();
