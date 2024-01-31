@@ -87,7 +87,8 @@ struct ONNXConvOpLowering : public OpConversionPattern<ONNXConvOp> {
     // Create a local reduction value.
     MemRefType tmpType = MemRefType::get({}, memRefType.getElementType());
     // Single scalar, no need for default alignment.
-    Value reductionVal = create.mem.alloca(tmpType);
+    //Value reductionVal = create.mem.alloca(tmpType);
+    ValueRange inits = {fZero};
     auto bodyFunction = [&](ValueRange outerIndices) {
       // Compute the Channel In Indices.
       IndexExprScope outerScope(create.krnl);
@@ -110,14 +111,15 @@ struct ONNXConvOpLowering : public OpConversionPattern<ONNXConvOp> {
       // for ho = 0 .. HO:
       //    for wo = 0 .. WO:
       create.krnl.iterateIE(outputSpacialLoops, outputSpacialLoops,
-          outputSpacialLbs, outputSpacialUbs,
+          outputSpacialLbs, outputSpacialUbs, inits,
           [&](KrnlBuilder &createKrnl, ValueRange outputSpatialIndices) {
             IndexExprScope outputSpacialScope(createKrnl);
             MultiDialectBuilder<KrnlBuilder, IndexExprBuilderForKrnl,
                 MathBuilder>
                 create(createKrnl);
             // Reset reduction value to zero.
-            create.krnl.store(fZero, reductionVal);
+            ValueRange innerInits = {fZero};
+            //create.krnl.store(fZero, reductionVal);
 
             // Bounds for reduction loops.
             ValueRange redLoops = create.krnl.defineLoops(spacialRank + 1);
@@ -152,8 +154,15 @@ struct ONNXConvOpLowering : public OpConversionPattern<ONNXConvOp> {
             // for ciPerGroup = 0 .. CIPerGroup:
             //   for kh in lb .. ub:
             //     for kw in lb .. ub:
-            create.krnl.iterateIE(redLoops, redLoops, redLbs, redUbs,
+            auto innerIterate = create.krnl.iterateIE(redLoops, redLoops,
+                redLbs, redUbs, innerInits,
                 [&](KrnlBuilder &createKrnl, ValueRange redIndices) {
+
+                  Block *innerIterEntryBB = createKrnl.getBuilder().getBlock();
+                  // Get last argument for the innerIterate body.
+                  Value iterArg = innerIterEntryBB->getArgument(
+                      innerIterEntryBB->getNumArguments() - 1);
+
                   IndexExprScope redScope(createKrnl);
                   MultiDialectBuilder<KrnlBuilder, IndexExprBuilderForKrnl,
                       MathBuilder>
@@ -190,13 +199,16 @@ struct ONNXConvOpLowering : public OpConversionPattern<ONNXConvOp> {
                   }
                   Value filter =
                       create.krnl.loadIE(filterOperand, filterAccessFct);
-                  Value oldRed = create.krnl.load(reductionVal);
+                  Value oldRed = iterArg;
+                  //create.krnl.load(reductionVal);
                   Value mul = create.math.mul(image, filter);
                   Value newRed = create.math.add(oldRed, mul);
-                  create.krnl.store(newRed, reductionVal);
+                  //create.krnl.store(newRed, reductionVal);
+                  // Create yield.
+                  create.krnl.yield(newRed);
                 }); // Reduction loops.
                     // Finish the reduction and store in result array.
-            Value result = create.krnl.load(reductionVal);
+            Value result = innerIterate.getResult(0);
             // Store the result. Optionally add bias.
             SymbolIndexExpr coInOutputSpacial(co);
             if (hasBias) {
@@ -209,6 +221,8 @@ struct ONNXConvOpLowering : public OpConversionPattern<ONNXConvOp> {
             for (Value o : outputSpatialIndices)
               resAccessFunc.emplace_back(DimIndexExpr(o));
             create.krnl.storeIE(result, alloc, resAccessFunc);
+            // Create yield.
+            create.krnl.yield(result);
           }); // Output spacial loops.
     };
 

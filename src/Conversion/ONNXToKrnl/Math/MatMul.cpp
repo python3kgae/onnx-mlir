@@ -67,22 +67,36 @@ struct ONNXMatMulOpLowering : public OpConversionPattern<ONNXMatMulOp> {
     loopUbs.emplace_back(innerUb);
     SmallVector<Value, 1> innerLoop{loopDef[totLoopNum - 1]}; // Last loop def.
     // Single scalar, no need for default alignment.
-    Value reductionVal =
-        create.mem.alignedAlloca(MemRefType::get({}, elementType));
+    //Value reductionVal =
+    //    create.mem.alignedAlloca(MemRefType::get({}, elementType));
     if (enableParallel) {
       create.krnl.parallel(outerLoops[0]);
       LLVM_DEBUG(llvm::dbgs() << "[Parallel Op]: onnx.MatMul\n");
     }
-
+    ValueRange inits = {fZero};
     // Non-reduction loop iterations: output-rank.
-    create.krnl.iterateIE(loopDef, outerLoops, loopLbs, loopUbs,
+    create.krnl.iterateIE(loopDef, outerLoops, loopLbs, loopUbs, inits,
         [&](KrnlBuilder &createKrnl, ValueRange outerIndices) {
+          Block *iterEntryBB = createKrnl.getBuilder().getBlock();
+          // Get last argument for the outerIterate body.
+          Value iterArg =
+              iterEntryBB->getArgument(
+                iterEntryBB->getNumArguments() - 1);
+
           MultiDialectBuilder<KrnlBuilder, MemRefBuilder, MathBuilder> create(
               createKrnl);
-          create.krnl.store(fZero, reductionVal);
+          //create.krnl.store(fZero, reductionVal);
+          //getRegionIterArgs();
+          ValueRange innerInits = {fZero};
           // Inner loop for reduction.
-          create.krnl.iterate({}, innerLoop, {}, {},
+          auto innerIterate = create.krnl.iterate({}, innerLoop, {}, {}, innerInits,
               [&](KrnlBuilder &createKrnl, ValueRange innerIndex) {
+                Block *innerIterEntryBB = createKrnl.getBuilder().getBlock();
+                // Get last argument for the innerIterate body.
+                Value iterArg =
+                    innerIterEntryBB->getArgument(
+                        innerIterEntryBB->getNumArguments() - 1);
+
                 MultiDialectBuilder<KrnlBuilder, MathBuilder> create(
                     createKrnl);
                 Value k = innerIndex[0];
@@ -120,13 +134,18 @@ struct ONNXMatMulOpLowering : public OpConversionPattern<ONNXMatMulOp> {
                     create.krnl.load(operandAdaptor.getA(), aAccessFct);
                 Value loadedB =
                     create.krnl.load(operandAdaptor.getB(), bAccessFct);
-                Value loadedY = create.krnl.load(reductionVal);
+                Value loadedY = iterArg;
+
                 Value AB = create.math.mul(loadedA, loadedB);
                 Value accumulated = create.math.add(loadedY, AB);
-                create.krnl.store(accumulated, reductionVal);
+                //create.krnl.store(accumulated, reductionVal);
+                // Create yield.
+                create.krnl.yield(accumulated);
               });
-          Value accumulated = create.krnl.load(reductionVal);
+          Value accumulated = innerIterate.getResult(0);
           create.krnl.store(accumulated, alloc, outerIndices);
+          // Create yield.
+          create.krnl.yield(accumulated);
         });
   }
 

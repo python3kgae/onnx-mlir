@@ -66,21 +66,28 @@ struct ONNXGemmOpLowering : public OpConversionPattern<GemmOp> {
     IndexExpr innerUb = shapeHelper.aDims[1];
     SmallVector<IndexExpr, 3> loopUbs{outerUb0, outerUb1, innerUb};
     // Create temp, single scalar, no need for default alignment.
-    Value red = create.mem.alloca(MemRefType::get({}, elementType));
+    //Value red = create.mem.alloca(MemRefType::get({}, elementType));
     // Outer loops.
     // FIXME refactor
     if (enableParallel) {
       create.krnl.parallel(outerLoopDef[0]);
       LLVM_DEBUG(llvm::dbgs() << "[Parallel Op]: onnx.GEMM\n");
     }
-    create.krnl.iterateIE(loopDef, outerLoopDef, loopLbs, loopUbs,
+    ValueRange inits = {zeroVal};
+    create.krnl.iterateIE(loopDef, outerLoopDef, loopLbs, loopUbs, inits,
         [&](KrnlBuilder &createKrnl, ValueRange outerIndices) {
           MultiDialectBuilder<KrnlBuilder, MathBuilder> create(createKrnl);
           // Set to zero.
-          create.krnl.store(zeroVal, red);
+          ValueRange innerInits = {zeroVal};
           // Inner loop.
-          create.krnl.iterate({}, innerLoopDef, {}, {},
+          auto innerIterate = create.krnl.iterate({}, innerLoopDef, {}, {},
+              innerInits,
               [&](KrnlBuilder &createKrnl, ValueRange innerIndex) {
+                Block *innerIterEntryBB = createKrnl.getBuilder().getBlock();
+                // Get last argument for the innerIterate body.
+                Value iterArg = innerIterEntryBB->getArgument(
+                    innerIterEntryBB->getNumArguments() - 1);
+
                 Value i(outerIndices[0]), j(outerIndices[1]), k(innerIndex[0]);
                 MultiDialectBuilder<KrnlBuilder, MathBuilder> create(
                     createKrnl);
@@ -98,12 +105,15 @@ struct ONNXGemmOpLowering : public OpConversionPattern<GemmOp> {
                 Value aVal = create.krnl.load(A, aAccess);
                 Value bVal = create.krnl.load(B, bAccess);
                 Value tmp = create.math.mul(aVal, bVal);
-                Value rVal = create.krnl.load(red);
-                create.krnl.store(create.math.add(tmp, rVal), red);
+                Value rVal = iterArg;
+                create.krnl.yield(create.math.add(tmp, rVal));
+                //create.krnl.store(create.math.add(tmp, rVal), red);
               });
+          Value accumulated = innerIterate.getResult(0);
+
           // Handle alpha/beta coefficients.
           IndexExprScope innerScope(create.krnl, shapeHelper.getScope());
-          Value res = create.math.mul(alphaVal, create.krnl.load(red));
+          Value res = create.math.mul(alphaVal, accumulated);
           if (shapeHelper.hasBias) {
             SmallVector<Value, 2> cAccess;
             for (int x = 2 - shapeHelper.cRank; x < 2; ++x) {
@@ -117,6 +127,8 @@ struct ONNXGemmOpLowering : public OpConversionPattern<GemmOp> {
             res = create.math.add(res, create.math.mul(betaVal, c));
           }
           create.krnl.store(res, R, outerIndices);
+          // Create yield.
+          create.krnl.yield(accumulated);
         });
   }
 

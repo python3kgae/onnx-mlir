@@ -312,9 +312,10 @@ struct ONNXPoolOpLowering : public OpConversionPattern<PoolOp> {
     auto identity = getIdentityValue<PoolOp>(rewriter, loc, outputElementType);
     // Create a local reduction value for output[n][c][ho][wo].
     // Single scalar, no need for default alignment.
-    Value reductionVal =
-        create.mem.alloca(MemRefType::get({}, memRefType.getElementType()));
+    //Value reductionVal =
+    //    create.mem.alloca(MemRefType::get({}, memRefType.getElementType()));
 
+    ValueRange inits = {identity};
     // 1. Define output loops to compute one output pixel.
     // for n in range(N):
     //   for c in range(C):
@@ -324,7 +325,7 @@ struct ONNXPoolOpLowering : public OpConversionPattern<PoolOp> {
     SmallVector<IndexExpr, 4> lbs(outputShape.size(), LiteralIndexExpr(0));
     SmallVector<IndexExpr, 4> ubs;
     create.krnlIE.getShapeAsDims(alloc, ubs);
-    create.krnl.iterateIE(calcLoopDef, calcLoopDef, lbs, ubs,
+    create.krnl.iterateIE(calcLoopDef, calcLoopDef, lbs, ubs,inits,
         [&](KrnlBuilder &createKrnl, ValueRange loopInd) {
           MultiDialectBuilder<KrnlBuilder, IndexExprBuilderForKrnl,
               MemRefBuilder, MathBuilder>
@@ -338,7 +339,8 @@ struct ONNXPoolOpLowering : public OpConversionPattern<PoolOp> {
             outputIndices.emplace_back(DimIndexExpr(loopInd[i]));
 
           // 2.1 Emit: output[n][c][ho][wo] = identity
-          create.krnl.store(identity, reductionVal);
+          ValueRange innerInits = {identity};
+          //create.krnl.store(identity, reductionVal);
 
           // 2.2 Emit affine maps which express the lower and upper bounds
           // for the pooling window's dimensions. The pooling window can be
@@ -431,48 +433,67 @@ struct ONNXPoolOpLowering : public OpConversionPattern<PoolOp> {
             pack.pushConstantBound(0);
             pack.pushAffineMapBound(windowSizeMap, operands);
           }
-          KrnlIterateOp iterateOp = create.krnl.iterate(pack);
           auto ipOuterLoopRegion = rewriter.saveInsertionPoint();
-          Block &iterationBlock = iterateOp.getBodyRegion().front();
-          rewriter.setInsertionPointToStart(&iterationBlock);
-          SmallVector<Value, 4> poolingLoopInd(
-              iterationBlock.getArguments().begin(),
-              iterationBlock.getArguments().end());
+          KrnlIterateOp iterateOp = create.krnl.iterate(pack, innerInits,
+              [&](KrnlBuilder &createKrnl, ValueRange redIndices) {
+                Block &iterationBlock = *createKrnl.getBuilder().getBlock();
 
-          {
-            // 2.4 Emit the body of the pooling loop nest.
-            // Prepare indices to access a pixel in the input.
-            SmallVector<IndexExpr, 4> inputIndices;
-            { // Construct inputIndices
-              for (int i = 0; i < kernelOffset; ++i)
-                inputIndices.emplace_back(outputIndices[i]);
-              for (int i = kernelOffset; i < (int)inputShape.size(); ++i) {
-                int j = i - kernelOffset;
-                DimIndexExpr hp(poolingLoopInd[j]);
-                IndexExpr startH = windowStartExprs[j];
-                if (isDilated) {
-                  // hi = hp * dH + startH
-                  IndexExpr dH = IVExprs[j][5];
-                  inputIndices.emplace_back(hp * dH + startH);
-                } else {
-                  // hi = hp + startH
-                  inputIndices.emplace_back(hp + startH);
+                SmallVector<Value, 4> poolingLoopInd(
+                    iterationBlock.getArguments().begin(),
+                    iterationBlock.getArguments().end());
+
+                {
+                  // 2.4 Emit the body of the pooling loop nest.
+                  // Prepare indices to access a pixel in the input.
+                  SmallVector<IndexExpr, 4> inputIndices;
+                  { // Construct inputIndices
+                    for (int i = 0; i < kernelOffset; ++i)
+                      inputIndices.emplace_back(outputIndices[i]);
+                    for (int i = kernelOffset; i < (int)inputShape.size();
+                         ++i) {
+                      int j = i - kernelOffset;
+                      DimIndexExpr hp(poolingLoopInd[j]);
+                      IndexExpr startH = windowStartExprs[j];
+                      if (isDilated) {
+                        // hi = hp * dH + startH
+                        IndexExpr dH = IVExprs[j][5];
+                        inputIndices.emplace_back(hp * dH + startH);
+                      } else {
+                        // hi = hp + startH
+                        inputIndices.emplace_back(hp + startH);
+                      }
+                    }
+                  }
+
+                  MultiDialectBuilder<KrnlBuilder, IndexExprBuilderForKrnl,
+                      MathBuilder>
+                      create(createKrnl);
+                  // Apply pooling operation.
+                  //      output[n][c][ho][wo] =
+                  //        emitScalarOpFor(output[n][c][ho][wo], input[n, c,
+                  //        hi, wi]);
+                  Value loadInput =
+                      create.krnl.loadIE(inputOperand, inputIndices);
+
+                  // Get last argument for the innerIterate body.
+                  Value iterArg = iterationBlock.getArgument(
+                      iterationBlock.getNumArguments() - 1);
+
+                  Value loadPartialOutput = iterArg;
+                  {
+                    Value lhs = loadPartialOutput;
+                    Value rhs = loadInput;
+                    Value max = create.math.sgt(lhs, rhs);
+                    Value output = create.math.select(max, lhs, rhs);
+                    //  Create yield.
+                    create.krnl.yield(output);
+                  }
                 }
-              }
-            }
+          });
 
-            // Apply pooling operation.
-            //      output[n][c][ho][wo] =
-            //        emitScalarOpFor(output[n][c][ho][wo], input[n, c, hi,
-            //        wi]);
-            Value loadInput = create.krnl.loadIE(inputOperand, inputIndices);
-            Value loadPartialOutput = create.krnl.load(reductionVal);
-            Value output = emitScalarOpFor<PoolOp>(rewriter, loc, op,
-                outputElementType, {loadPartialOutput, loadInput});
-            create.krnl.store(output, reductionVal);
-          }
           rewriter.restoreInsertionPoint(ipOuterLoopRegion);
-          Value output = createKrnl.load(reductionVal);
+          Value accumulated = iterateOp.getResult(0);
+          Value output = accumulated;
           create.krnl.storeIE(output, alloc, outputIndices);
 
           // 2.5 Post-processing for the pooling window, e.g. taking
@@ -482,6 +503,9 @@ struct ONNXPoolOpLowering : public OpConversionPattern<PoolOp> {
             outputIndicesInValue.emplace_back(expr.getValue());
           postProcessPoolingWindow<PoolOp>(rewriter, loc, poolOp, alloc,
               outputIndicesInValue, shapeHelper.kernelShape, fullWindowSize);
+
+          // Create yield.
+          create.krnl.yield(output);
         });
 
     rewriter.replaceOp(op, alloc);

@@ -371,9 +371,14 @@ static void lowerIterateOp(KrnlIterateOp &iterateOp, OpBuilder &builder,
   auto operandItr =
       iterateOp.operand_begin() + iterateOp.getNumOptimizedLoops();
 
+  ValueRange inits =
+      iterateOp
+          .getIterArgInits(); // Get the initial values for the optimized loops.
+
   // For each bounds, create an original loop with its original bounds using
   // an affine.for. This affine.for will be transformed if any optimizations are
   // present on the loop nest (aka permute, tile, ...).
+  std::vector<AffineForOp> affineLoops;
   for (size_t boundIdx = 0; boundIdx < boundMapAttrs.size(); boundIdx += 2) {
     // Consume input loop operand, at this stage, do not do anything with it.
     auto unoptimizedLoopRef = *(operandItr++);
@@ -390,8 +395,9 @@ static void lowerIterateOp(KrnlIterateOp &iterateOp, OpBuilder &builder,
           operands.end(), operandItr, operandItr + map.getNumInputs());
       std::advance(operandItr, map.getNumInputs());
     }
-    auto forOp = builder.create<AffineForOp>(
-        iterateOp.getLoc(), lbOperands, lbMap, ubOperands, ubMap);
+
+    auto forOp = builder.create<AffineForOp>(iterateOp.getLoc(), lbOperands,
+        lbMap, ubOperands, ubMap, /*step*/ 1, inits);
 
     currentNestedForOps.emplace_back(std::make_pair(unoptimizedLoopRef, forOp));
     builder.setInsertionPoint(
@@ -399,6 +405,18 @@ static void lowerIterateOp(KrnlIterateOp &iterateOp, OpBuilder &builder,
         llvm::cast<AffineForOp>(currentNestedForOps.back().second)
             .getBody()
             ->begin());
+
+    //inits = forOp.getRegionIterArgs();
+    affineLoops.push_back(forOp);
+  }
+
+  // add yield for each affine.for created with result of inner affine.for except innermost affine.for.
+  for (int64_t i = 0; i < (int64_t)affineLoops.size() - 1; i++) {
+    auto forOp = affineLoops[i];
+    auto innerForOp = affineLoops[i + 1];
+    builder.setInsertionPointToEnd(forOp.getBody());
+    auto yieldOp = builder.create<AffineYieldOp>(
+        iterateOp.getLoc(), innerForOp.getResults());
   }
 
   // Replace induction variable references from those introduced by a
@@ -415,7 +433,8 @@ static void lowerIterateOp(KrnlIterateOp &iterateOp, OpBuilder &builder,
 
   // Pop krnl.iterate body region block arguments, leave the last one
   // for convenience (it'll be taken care of by region inlining).
-  while (iterateOp.getBodyRegion().front().getNumArguments() > 1)
+  unsigned int numIterArgs = iterateOp.getNumIterArgs();
+  while (iterateOp.getBodyRegion().front().getNumArguments() > (numIterArgs+1))
     iterateOp.getBodyRegion().front().eraseArgument(0);
 
   if (currentNestedForOps.empty()) {
@@ -423,12 +442,30 @@ static void lowerIterateOp(KrnlIterateOp &iterateOp, OpBuilder &builder,
     // body region to the parent region of iterateOp.
     Block *parentBlock = iterateOp->getBlock();
     Block &iterateOpEntryBlock = iterateOp.getBodyRegion().front();
+
+    if (!iterateOp.use_empty()) {
+      // find the outter affine.for op.
+      auto outterForOp = cast<AffineForOp>(parentBlock->getParentOp());
+
+      // replace use of iterateOp result with outter affine.for result.
+      for (auto [result, newResult] :
+          llvm::zip(iterateOp.getResults(), outterForOp.getResults())) {
+        result.replaceAllUsesWith(newResult);
+      }
+      // replace region iterArgs with outter affine.for region iterArgs.
+      for (auto [iterArg, newIterArg] : llvm::zip(iterateOp.getRegionIterArgs(),
+               outterForOp.getRegionIterArgs())) {
+            iterArg.replaceAllUsesWith(newIterArg);
+        }
+    }
     // Transfer body region operations to parent region, without the terminator
     // op.
     parentBlock->getOperations().splice(iterateOp->getIterator(),
         iterateOpEntryBlock.getOperations(),
         iterateOpEntryBlock.front().getIterator(),
-        iterateOpEntryBlock.getTerminator()->getIterator());
+        iterateOpEntryBlock.end());
+    // remove terminator of parent block.
+    parentBlock->getOperations().pop_back();
   } else {
     // Transfer krnl.iterate region to innermost for op.
     auto innermostForOp =
@@ -437,6 +474,29 @@ static void lowerIterateOp(KrnlIterateOp &iterateOp, OpBuilder &builder,
     Region &innerMostRegion = innermostForOp.getRegion();
     innerMostRegion.getBlocks().splice(
         innerMostRegion.end(), iterateOp.getBodyRegion().getBlocks());
+    // Replace use of iterateOp result with innermost for op result.
+    if (!iterateOp.use_empty()) {
+        // replace use of iterateOp result with op result in the same region.
+      for (auto result : iterateOp.getResults()) {
+          for (auto user : make_early_inc_range(result.getUsers())) {
+          auto block = user->getBlock();
+            for (auto it : currentNestedForOps) {
+            if (block == &*it.second->getBlock()) {
+                    // NOTE: should not be result(0).
+                  user->replaceUsesOfWith(result, it.second->getResult(0));
+                    break;
+                }
+            }
+          }
+      }
+        for (auto [result, newResult] :
+            llvm::zip(iterateOp.getResults(), innermostForOp.getResults())) {
+          result.replaceAllUsesWith(newResult);
+        }
+
+        // don't need to replace region iterArgs with innermost for op region iterArgs.
+        // because the blocks are moved to innermost for op region.
+    }
   }
 
   for (const auto &pair : currentNestedForOps)
@@ -472,6 +532,16 @@ static void removeOps(llvm::SmallPtrSetImpl<Operation *> &opsToErase) {
     }
     if (opsToErase.empty())
       break;
+  }
+  if (!opsToErase.empty()) {
+    llvm::errs() << "Error: unable to remove the following operations:\n";
+    for (Operation *op : opsToErase) {
+
+      llvm::errs() << "fail to remove \n";
+      op->dump();
+      for (auto *user : op->getUsers())
+        user->dump();
+    }
   }
 }
 
@@ -777,6 +847,7 @@ void ConvertKrnlToAffinePass::runOnOperation() {
   // krnl.dim operations must be lowered prior to this pass.
   target.addIllegalOp<KrnlDimOp>();
   target.addIllegalOp<KrnlMatMulOp>();
+  target.addIllegalOp<KrnlYieldOp>();
   target.addIllegalOp<KrnlCopyToBufferOp>();
   target.addIllegalOp<KrnlCopyFromBufferOp>();
   target.addLegalOp<AffineYieldOp>();
@@ -814,6 +885,34 @@ void ConvertKrnlToAffinePass::runOnOperation() {
     signalPassFailure();
     return;
   }
+
+  // remove affine.yield which is not the last operation in the block.
+  funcOp.walk([&](AffineYieldOp yieldOp) {
+        if (yieldOp->getNextNode() != nullptr)
+        yieldOp.erase();
+    });
+
+  // for all user of affine.for, if the user is not dominated by affine.for,
+  // replace with outter affine.for which dominates the user.
+  funcOp.walk([&](AffineForOp forOp) {
+    for (auto result : forOp.getResults()) {
+      auto parentBlock = forOp->getBlock();
+      for (auto user : make_early_inc_range(result.getUsers())) {
+        auto block = user->getBlock();
+        if (block != parentBlock) {
+
+          // find affine.forOp in block.
+          for (auto it = Block::reverse_iterator(user); it != block->rend(); ++it) {
+              if (auto forOp = dyn_cast_or_null<AffineForOp>(&*it)) {
+              user->replaceUsesOfWith(result, forOp.getResult(0));
+              break;
+            }
+          }
+
+        }
+      }
+    }
+  });
 
   for (auto record : *currUnrollAndJamList) {
     LogicalResult res = loopUnrollJamUpToFactor(record.first, record.second);

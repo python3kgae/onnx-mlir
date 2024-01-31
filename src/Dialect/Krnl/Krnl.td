@@ -49,6 +49,8 @@ def StringType : Type<CPred<"$_self.isa<krnl::StringType>()">, "string type">;
 // Require regions to have krnl.terminate terminator operation.
 def ImplicitKrnlTerminator : SingleBlockImplicitTerminator<"KrnlTerminatorOp">;
 
+def ImplicitKrnlYield : SingleBlockImplicitTerminator<"KrnlYieldOp">;
+
 def KrnlCallOp : Op<Krnl_Dialect, "call",
     [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]
   > {
@@ -129,8 +131,36 @@ def KrnlDefineLoopsOp : Op<Krnl_Dialect, "define_loops"> {
   }];
 }
 
-def KrnlIterateOp : Op<Krnl_Dialect, "iterate", [ImplicitKrnlTerminator,
-    DeclareOpInterfaceMethods<LoopLikeOpInterface>]> {
+
+def KrnlYieldOp : Op<Krnl_Dialect, "yield", [Pure, Terminator, ReturnLike,
+    MemRefsNormalizable]> {
+  let summary = "Yield values to parent operation";
+  let description = [{
+    The `krnl.yield` yields zero or more SSA values from an krnl.iterate op region and
+    terminates the region. The semantics of how the values yielded are used
+    is defined by the parent operation.
+    If `krnl.yield` has any operands, the operands must match the parent
+    operation's results.
+    If the parent operation defines no values, then the `krnl.yield` may be
+    left out in the custom syntax and the builders will insert one implicitly.
+    Otherwise, it has to be present in the syntax to indicate which values are
+    yielded.
+  }];
+
+  let arguments = (ins Variadic<AnyType>:$operands);
+
+  let builders = [
+    OpBuilder<(ins), [{ build($_builder, $_state, std::nullopt); }]>
+  ];
+
+  let assemblyFormat = "attr-dict ($operands^ `:` type($operands))?";
+  let hasVerifier = 1;
+}
+
+def KrnlIterateOp : Op<Krnl_Dialect, "iterate", [ImplicitKrnlYield,
+    DeclareOpInterfaceMethods<LoopLikeOpInterface
+    //, ["getYieldedValuesMutable", "replaceWithAdditionalYields"]
+    >]> {
   let summary = "iterate operation";
   let description = [{
     The "krnl.iterate" operation is conceptually equivalent to a nested for loops.
@@ -159,8 +189,8 @@ def KrnlIterateOp : Op<Krnl_Dialect, "iterate", [ImplicitKrnlTerminator,
     ```
   }];
 
-  let arguments = (ins Variadic<AnyType>);
-
+  let arguments = (ins Variadic<AnyType>:$rangeArgs);
+  let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$bodyRegion);
 
   let skipDefaultBuilders = 1;
@@ -202,6 +232,16 @@ def KrnlIterateOp : Op<Krnl_Dialect, "iterate", [ImplicitKrnlTerminator,
       return num_optimized_loops;
     }
 
+  int64_t getNumIterArgs() {
+    return getNumResults();
+  }
+  Block::BlockArgListType getRegionIterArgs() {
+    return Block::BlockArgListType(getBody()->getArguments().begin(),
+      getBody()->getArguments().end());
+  }
+  ValueRange getIterArgInits() {
+    return iterator_range(operand_begin()+ (getNumOperands() - getNumIterArgs()), operand_end());
+  }
     // Get name of the attribute for storing bound represented using affine maps.
       static StringRef getBoundsAttrName() { return "bounds"; }
   }];
@@ -732,7 +772,7 @@ def KrnlStoreOp : Op<Krnl_Dialect, "store",
   }];
 }
 
-def KrnlMovableOp : Op<Krnl_Dialect, "movable", [ImplicitKrnlTerminator]> {
+def KrnlMovableOp : Op<Krnl_Dialect, "movable", [ImplicitKrnlYield]> {
   let summary = "Krnl movable operation";
   let description = [{
      Encapsulates a list of operations, which should be moved under a newly lowered

@@ -130,16 +130,23 @@ void KrnlBuilder::parallel(ValueRange loops) const {
   b().template create<KrnlParallelOp>(loc(), loops);
 }
 
-void KrnlBuilder::iterate(ValueRange originalLoops, ValueRange optimizedLoops,
+KrnlIterateOp KrnlBuilder::iterate(ValueRange originalLoops,
+    ValueRange optimizedLoops,
     ValueRange lbs, ValueRange ubs,
+    function_ref<void(KrnlBuilder &createKrnl, ValueRange indices)>
+        bodyBuilderFn) const {
+  return iterate(originalLoops, optimizedLoops, lbs, ubs, {}, bodyBuilderFn);
+}
+
+KrnlIterateOp KrnlBuilder::iterate(ValueRange originalLoops,
+    ValueRange optimizedLoops, ValueRange lbs, ValueRange ubs, ValueRange inits,
     function_ref<void(KrnlBuilder &createKrnl, ValueRange indices)>
         bodyBuilderFn) const {
   // Check that originalLoops, lbs, and ubs have the same rank.
   assert(originalLoops.size() == lbs.size() && "expected same rank");
   assert(originalLoops.size() == ubs.size() && "expected same rank");
-  ValueRange empty;
-  b().create<KrnlIterateOp>(loc(), originalLoops, optimizedLoops, lbs, ubs,
-      empty, [&](OpBuilder &builder, Location loc, ValueRange args) {
+  return b().create<KrnlIterateOp>(loc(), originalLoops, optimizedLoops, lbs,
+      ubs, inits, [&](OpBuilder &builder, Location loc, ValueRange args) {
         KrnlBuilder createKrnl(builder, loc);
         ValueRange indices = createKrnl.getInductionVarValue(optimizedLoops);
         bodyBuilderFn(createKrnl, indices);
@@ -151,20 +158,43 @@ KrnlIterateOp KrnlBuilder::iterate(
   return b().create<KrnlIterateOp>(loc(), operands);
 }
 
-void KrnlBuilder::iterateIE(ValueRange originalLoops, ValueRange optimizedLoops,
+KrnlIterateOp KrnlBuilder::iterate(const krnl::KrnlIterateOperandPack &operands,
+    mlir::ValueRange inits, mlir::function_ref<void(
+        KrnlBuilder &createKrnl, mlir::ValueRange indices)>
+        bodyBuilderFn) const {
+  return b().create<KrnlIterateOp>(loc(), operands, inits,
+      [&](OpBuilder &builder, Location loc, ValueRange args) {
+        KrnlBuilder createKrnl(builder, loc);
+        bodyBuilderFn(createKrnl, {});
+      });
+}
+
+KrnlIterateOp KrnlBuilder::iterateIE(ValueRange originalLoops,
+    ValueRange optimizedLoops,
     ArrayRef<IndexExpr> lbs, ArrayRef<IndexExpr> ubs,
+    function_ref<void(KrnlBuilder &createKrnl, ValueRange indices)>
+        bodyBuilderFn) const {
+  return iterateIE(originalLoops, optimizedLoops, lbs, ubs, {}, bodyBuilderFn);
+}
+
+KrnlIterateOp KrnlBuilder::iterateIE(ValueRange originalLoops,
+    ValueRange optimizedLoops, ArrayRef<IndexExpr> lbs, ArrayRef<IndexExpr> ubs,
+    ValueRange inits,
     function_ref<void(KrnlBuilder &createKrnl, ValueRange indices)>
         bodyBuilderFn) const {
   // Check that originalLoops, lbs, and ubs have the same rank.
   assert(originalLoops.size() == lbs.size() && "expected same rank");
   assert(originalLoops.size() == ubs.size() && "expected same rank");
-  ValueRange empty;
-  b().create<KrnlIterateOp>(loc(), originalLoops, optimizedLoops, lbs, ubs,
-      empty, [&](OpBuilder &builder, Location loc, ValueRange args) {
+  return b().create<KrnlIterateOp>(loc(), originalLoops, optimizedLoops, lbs,
+      ubs, inits, [&](OpBuilder &builder, Location loc, ValueRange args) {
         KrnlBuilder createKrnl(builder, loc);
         ValueRange indices = createKrnl.getInductionVarValue(optimizedLoops);
         bodyBuilderFn(createKrnl, indices);
       });
+}
+
+void KrnlBuilder::yield(mlir::ValueRange iterArgs) const {
+  b().create<KrnlYieldOp>(loc(), iterArgs);
 }
 
 void KrnlBuilder::copyToBuffer(Value bufferMemref, Value sourceMemref,

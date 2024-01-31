@@ -234,6 +234,10 @@ void KrnlIterateOp::build(OpBuilder &builder, OperationState &result,
     function_ref<void(OpBuilder &, Location, ValueRange)> bodyBuilderFn) {
   // Record optimized loops and the number of such loops.
   result.addOperands(operandPack.getOperands());
+  result.addOperands(iterArgs);
+  for (auto iterArg : iterArgs)
+    result.addTypes(iterArg.getType());
+
   result.addAttribute(
       KrnlIterateOp::getBoundsAttrName(), operandPack.getAttributes());
   result.addAttribute(getNumOptimizedLoopsAttrName(),
@@ -249,6 +253,8 @@ void KrnlIterateOp::build(OpBuilder &builder, OperationState &result,
   auto body_arg_locs = llvm::SmallVector<Location, 4>(
       operandPack.getNumInputLoops(), result.location);
   body->addArguments(body_args, body_arg_locs);
+  for (Value val : iterArgs)
+    body->addArgument(val.getType(), val.getLoc());
   bodyRegion->push_back(body);
 
   // If nonnull, invoke the lambda function that creates the loop body. This
@@ -316,7 +322,12 @@ void KrnlIterateOp::print(OpAsmPrinter &printer) {
     printer << ")";
     return;
   }
-  auto inductionVars = getBodyRegion().begin()->getArguments();
+  auto entryBBArgs = getBodyRegion().begin()->getArguments();
+  auto numEntryBBArgs = entryBBArgs.size();
+  auto numIterArgs = getNumIterArgs();
+  auto numInductionVars = numEntryBBArgs - numIterArgs;
+  auto inductionVars = Block::BlockArgListType(entryBBArgs.begin(),
+       entryBBArgs.begin() + numInductionVars);
   auto boundItr =
       (*this)
           ->getAttrOfType<ArrayAttr>(KrnlIterateOp::getBoundsAttrName())
@@ -342,6 +353,28 @@ void KrnlIterateOp::print(OpAsmPrinter &printer) {
   printer << ")";
   printer.printRegion(getBodyRegion(), /*printEntryBlockArgs=*/false,
       /*printBlockTerminators=*/false);
+}
+
+//===----------------------------------------------------------------------===//
+// KrnlYieldOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult KrnlYieldOp::verify() {
+  auto *parentOp = (*this)->getParentOp();
+  auto results = parentOp->getResults();
+  auto operands = getOperands();
+
+  if (!isa<KrnlIterateOp>(parentOp))
+    return emitOpError() << "only terminates krnl.iterate regions";
+  if (parentOp->getNumResults() != getNumOperands())
+    return emitOpError() << "parent of yield must have same number of "
+                            "results as the yield operands";
+  for (auto it : llvm::zip(results, operands)) {
+    if (std::get<0>(it).getType() != std::get<1>(it).getType())
+      return emitOpError() << "types mismatch between yield op and its parent";
+  }
+
+  return success();
 }
 
 namespace {
