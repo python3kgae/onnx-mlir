@@ -27,12 +27,25 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "src/Dialect/Krnl/KrnlOps.hpp"
 #include "llvm/Support/Debug.h"
+#include "llvm/ADT/TypeSwitch.h"
+
+
+
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
+
+
+
+#include <optional>
 
 #define DEBUG_TYPE "krnl-entry-to-gpu"
 
 using namespace mlir;
 using namespace mlir::gpu;
 using namespace mlir::affine;
+
 
 namespace {
 /// A pass converting MLIR Krnl entrys into the GPU dialect.
@@ -139,6 +152,38 @@ static LogicalResult checkAffineLoopNestMappable(
   return checkAffineLoopNestMappableImpl(forOp, numBlockDims + numThreadDims);
 }
 
+SmallVector<AffineForOp, 4> collectAffineLoopNestBounds(AffineForOp forOp) {
+  OpBuilder builder(forOp.getOperation());
+  AffineForOp currentLoop = forOp;
+  SmallVector<AffineForOp, 4> loops;
+
+  while (true) {
+    if (!currentLoop.hasConstantBounds())
+              break;
+    auto lb = currentLoop.getConstantLowerBound();
+    auto ub = currentLoop.getConstantUpperBound();
+    auto step = currentLoop.getStep();
+    lb++;
+    ub++;
+
+    if (currentLoop.getBody()->getOperations().size() != 2) {
+      loops.push_back(currentLoop);
+      break;
+    }
+
+    if (!isa<AffineYieldOp>(&currentLoop.getBody()->back()))
+      break;
+
+    if (auto nestForOp =
+            dyn_cast<AffineForOp>(&currentLoop.getBody()->front())) {
+      loops.push_back(currentLoop);
+      currentLoop = nestForOp;
+    } else {
+      break;
+    }
+  }
+  return loops;
+}
 
 namespace {
 // Helper structure that holds common state of the loop to GPU kernel
@@ -159,6 +204,8 @@ struct AffineLoopToGpuConverter {
   SmallVector<Value, 6> ivs;
   // Steps of the loops mapped to blocks or threads.
   SmallVector<Value, 6> steps;
+  unsigned NumGroups = 1;
+  unsigned GroupSize = 1;
 };
 } // namespace
 
@@ -299,6 +346,11 @@ void AffineLoopToGpuConverter::createGlobalID(AffineForOp rootForOp,
   thenBlk.getOperations().splice(thenBlk.begin(),
       innermostForOp.getBody()->getOperations());
 
+  auto prevTerm = thenBlk.back().getPrevNode();
+  if (prevTerm && isa<AffineYieldOp>(prevTerm)) {
+    prevTerm->erase();
+  }
+
   // Move allocs which only used in the thenBlk into thenBlk.
   // This will help mem2reg remove the allocs.
   auto usedInThenBlk = [&ifOp](Operation *op) {
@@ -321,17 +373,186 @@ void AffineLoopToGpuConverter::createGlobalID(AffineForOp rootForOp,
   rootForOp.erase();
 }
 
-void convertAffineLoopNestToGPUGlobalID(
-    AffineForOp forOp, unsigned numBlockDims=1, unsigned numThreadDims=1) {
-  if (failed(checkAffineLoopNestMappable(forOp, numBlockDims, numThreadDims)))
-    return;
+std::optional<AffineLoopToGpuConverter> convertAffineLoopNestToGPUGlobalID(
+    AffineForOp forOp, unsigned numBlockDims = 1, unsigned numThreadDims = 1) {
+  auto loops = collectAffineLoopNestBounds(forOp);
+  // No top level loops.
+  if (loops.empty())
+    return std::nullopt;
+
+  // Translate the loop nest to a GPU kernel in 1D.
+  // 1D is easier to handle, the cost is extra instruction to compute the index
+  // for each loop.
+  unsigned totalLoopCount = 1;
+  for (auto &loop : loops) {
+    auto lb = loop.getConstantLowerBound();
+    auto ub = loop.getConstantUpperBound();
+    auto step = loop.getStep();
+    auto range = ub - lb;
+    totalLoopCount *= range / step.getZExtValue();
+  }
+
+  const unsigned MaxGroupSize = 1024;
+  unsigned groupSize = MaxGroupSize;
+  unsigned numDispatch = 1;
+  if (totalLoopCount > MaxGroupSize) {
+    // Need dispatch multiple groups.
+    numDispatch = (totalLoopCount + (MaxGroupSize - 1)) / MaxGroupSize;
+  } else {
+    // Need dispatch one group.
+    numDispatch = 1;
+    groupSize = totalLoopCount;
+  }
+
+  OpBuilder builder(forOp.getOperation());
+  Value id;
+  if (numDispatch == 1)
+    id = builder.create<gpu::ThreadIdOp>(forOp.getLoc(), gpu::Dimension::x);
+  else
+    id = builder.create<gpu::GlobalIdOp>(forOp.getLoc(), gpu::Dimension::x);
+
+  // The result will be
+  //  1D grid and 1D block;
+  //  if (global_idx < totalLoopCount) {
+  //    // loop body
+  //  }
+  // create if (global_idx < totalLoopCount)
+  auto totalLoopCountC =
+      builder.create<arith::ConstantIndexOp>(forOp.getLoc(), totalLoopCount);
+  Value cond = builder.create<arith::CmpIOp>(
+      forOp.getLoc(), arith::CmpIPredicate::slt, id, totalLoopCountC);
+  auto ifOp =
+      builder.create<scf::IfOp>(forOp.getLoc(), ValueRange(), cond, false);
+  auto &thenBlk = ifOp.getThenRegion().back();
+
+  // If numDispatch is 1, use threadID.
+  // Else use globalID.
+  builder.setInsertionPointToStart(&thenBlk);
+
+  unsigned currentLoopCount = totalLoopCount;
+  Value currentId = id;
+  for (auto &loop : loops) {
+    auto lb = loop.getConstantLowerBound();
+    auto ub = loop.getConstantUpperBound();
+    auto step = loop.getStep();
+    auto range = ub - lb;
+
+    unsigned loopCount = range / step.getZExtValue();
+    //unsigned threadsPerLoop = currentLoopCount / loopCount;
+    auto loopCountC =
+        builder.create<arith::ConstantIndexOp>(forOp.getLoc(), loopCount);
+    // Idx = global_idx % loopCount;
+    Value idx =
+        builder.create<arith::RemSIOp>(forOp.getLoc(), currentId, loopCountC);
+    assert(currentLoopCount % loopCount == 0);
+    // global_idx = global_idx / loopCount;
+    currentId =
+        builder.create<arith::DivSIOp>(forOp.getLoc(), currentId, loopCountC);
+
+    // Replace loop induction variable with idx.
+    auto lbc = builder.create<arith::ConstantIndexOp>(forOp.getLoc(), lb);
+    auto ivReplacement =
+        builder.create<arith::AddIOp>(forOp.getLoc(), lbc, idx);
+    loop.getInductionVar().replaceAllUsesWith(ivReplacement);
+
+    // If loop has result, we need to replace the loop with the yield value.
+    if (!loop.getResultTypes().empty()) {
+      if (!loop->use_empty()) {
+        auto yieldOp = cast<AffineYieldOp>(loop.getBody()->getTerminator());
+        auto yieldValue = yieldOp.getOperand(0);
+        loop.getResult(0).replaceAllUsesWith(yieldValue);
+      }
+      // Replace arg with init value.
+      for (auto it : llvm::zip(loop.getRegionIterArgs(), loop.getInits())) {
+        auto arg = std::get<0>(it);
+        auto init = std::get<1>(it);
+        arg.replaceAllUsesWith(init);
+      }
+    }
+  }
+
+  auto innermostForOp = loops.back();
+  // Move the operations of rootForOp's body into thenBlk.
+  thenBlk.getOperations().splice(
+      std::prev(thenBlk.end()), innermostForOp.getBody()->getOperations());
+
+  auto prevTerm = thenBlk.back().getPrevNode();
+  if (prevTerm && isa<AffineYieldOp>(prevTerm)) {
+    prevTerm->erase();
+  }
+
+  // delete the loop.
+  forOp.erase();
+
+  //if (failed(checkAffineLoopNestMappable(forOp, numBlockDims, numThreadDims)))
+  //  return std::nullopt;
 
   AffineLoopToGpuConverter converter;
-  auto maybeInnerLoop =
-      converter.collectBounds(forOp, numBlockDims + numThreadDims);
-  if (!maybeInnerLoop)
-    return;
-  converter.createGlobalID(forOp, *maybeInnerLoop, numBlockDims, numThreadDims);
+  //auto maybeInnerLoop =
+  //    converter.collectBounds(forOp, numBlockDims + numThreadDims);
+  //if (!maybeInnerLoop)
+  //  return std::nullopt;
+  //converter.createGlobalID(forOp, *maybeInnerLoop, numBlockDims, numThreadDims);
+  converter.NumGroups = numDispatch;
+  converter.GroupSize = groupSize;
+  return converter;
+}
+
+void lowerAffineLoadStoreToMemRefLoadStore(Region &body) {
+
+  SmallVector<affine::AffineLoadOp, 4> loops;
+
+  // Gathers all loops.
+  body.walk(
+      [&](affine::AffineLoadOp forOp) { loops.push_back(forOp); });
+
+  for (auto forOp : loops) {
+    OpBuilder builder(forOp.getOperation());
+    auto memRefType = forOp.getMemRefType();
+    // Expand affine map from 'affineLoadOp'.
+    SmallVector<Value, 8> indices(forOp.getMapOperands());
+    auto resultOperands = affine::expandAffineMap(
+        builder, forOp.getLoc(), forOp.getAffineMap(), indices);
+    Value load = builder.create<memref::LoadOp>(
+        forOp.getLoc(), forOp.getMemRef(), *resultOperands);
+    forOp.replaceAllUsesWith(load);
+    forOp.erase();
+  }
+
+  SmallVector<affine::AffineStoreOp, 4> stores;
+  body.walk(
+      [&](affine::AffineStoreOp forOp) { stores.push_back(forOp); });
+  for (auto store : stores) {
+    OpBuilder builder(store.getOperation());
+    auto memRefType = store.getMemRefType();
+    // Expand affine map from 'affineLoadOp'.
+    SmallVector<Value, 8> indices(store.getMapOperands());
+    auto maybeExpandedMap = affine::expandAffineMap(
+        builder, store.getLoc(), store.getAffineMap(), indices);
+    builder.create<memref::StoreOp>(store.getLoc(), store.getValueToStore(),
+        store.getMemRef(), *maybeExpandedMap);
+    store.erase();
+  }
+}
+
+ArrayRef<char> getRawData(KrnlGlobalOp &op) {
+  ArrayRef<char> rawData;
+  assert(op.getValue().has_value() && "Krnl Global must always have a value");
+  auto value = op.getValue().value();
+  llvm::TypeSwitch<Attribute>(value)
+      .Case<DenseResourceElementsAttr>([&](DenseResourceElementsAttr attr) {
+        auto blob =
+            value.cast<DenseResourceElementsAttr>().getRawHandle().getBlob();
+        assert(blob && "Expecting dense resource with a valid blob");
+        rawData = blob->getData();
+      })
+      .Case<DenseElementsAttr>([&](DenseElementsAttr attr) {
+        DenseElementsAttr denseAttr =
+            value.dyn_cast_or_null<DenseElementsAttr>();
+        rawData = denseAttr.getRawData();
+      })
+      .Default([&](Attribute attr) { return; });
+  return rawData;
 }
 
 void ConvertKrnlEntryToGPUPass::runOnOperation() {
@@ -362,6 +583,46 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
   func::FuncOp entryPointFunc =
       dyn_cast<func::FuncOp>(module.lookupSymbol(entryPointFuncName));
   assert(entryPointFunc && "entry point func must exist");
+  entryPointFunc.getBody();
+
+  // Lower krnl.global into constant.
+  // This is a temporary solution. We should lower krnl.global into something spirv can understand.
+  // ConvertGPUToSPIRV cannot lower memref.alloc.
+  {
+    // auto globalOps = entryPointFunc.getOps<KrnlGlobalOp>();
+    //  collect all global ops.
+    SmallVector<KrnlGlobalOp, 4> globalOps;
+    entryPointFunc.walk(
+        [&](KrnlGlobalOp globalOp) { globalOps.push_back(globalOp); });
+
+    for (auto globalOp : globalOps) {
+      OpBuilder builder(globalOp.getOperation());
+      Type type = globalOp.getType();
+      auto memRefTy = cast<MemRefType>(type);
+      auto eltTy = memRefTy.getElementType();
+      auto shapeTy = RankedTensorType::get(memRefTy.getShape(), eltTy);
+
+      Location loc = globalOp.getLoc();
+      DenseElementsAttr valueAttr =
+          DenseElementsAttr::getFromRawBuffer(shapeTy, getRawData(globalOp));
+
+      auto constantOp = builder.create<arith::ConstantOp>(loc, valueAttr);
+
+      auto alloc = builder.create<memref::AllocOp>(loc, memRefTy);
+      builder.create<memref::TensorStoreOp>(loc, constantOp, alloc);
+
+      globalOp.replaceAllUsesWith(alloc.getResult());
+      globalOp.erase();
+    }
+  }
+
+
+
+  // Create GPU module.
+  OpBuilder builder(context);
+  builder.setInsertionPointToStart(module.getBody());
+  auto kernelModule = builder.create<gpu::GPUModuleOp>(
+      entryPointFunc.getLoc(), Twine(entryPointFunc.getName(), "_GPU").str());
 
   {
     // translate top level loops to gpu.globalID.
@@ -374,68 +635,162 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
         loops.push_back(forOp);
     });
 
-    for (auto forOp : loops)
-      convertAffineLoopNestToGPUGlobalID(forOp);
-  }
-
-  {
-    SmallVector<affine::AffineLoadOp, 4> loops;
-
-    // Gathers all loops.
-    entryPointFunc.getBody().walk(
-        [&](affine::AffineLoadOp forOp) { loops.push_back(forOp); });
-
+    // For each top level affine.for.
+    // create a gpu func and clone into the gpu func.
+    // Then scan for operand which not defined outside of affine.
+    // clone these too.
+    // In the end, switch tensor memref.alloc as parameter.
+    // and replace the affine for with gpu launch.
+    // Then remove the affine.for.
+    SmallVector<Operation *, 4> clonedForOps;
+    unsigned loopCount = 0;
     for (auto forOp : loops) {
-      OpBuilder builder(forOp.getOperation());
-      auto memRefType = forOp.getMemRefType();
-      // Expand affine map from 'affineLoadOp'.
-      SmallVector<Value, 8> indices(forOp.getMapOperands());
-      auto resultOperands =
-          affine::expandAffineMap(builder, forOp.getLoc(), forOp.getAffineMap(), indices);
-      Value load = builder.create<memref::LoadOp>(forOp.getLoc(), forOp.getMemRef(), *resultOperands);
-      forOp.replaceAllUsesWith(load);
+      // collect used values which defined outside of affine.for.
+      llvm::SetVector<Value> usedValues;
+      mlir::getUsedValuesDefinedAbove(forOp.getBodyRegion(), usedValues);
+      llvm::SmallVector<Value, 4> constValues;
+      llvm::SmallVector<Value, 4> argValues;
+      for (auto v : usedValues) {
+        if (!forOp.isDefinedOutsideOfLoop(v))
+          continue;
+        Operation *def = v.getDefiningOp();
+        if (def && isa<KrnlGlobalOp, arith::ConstantOp, arith::ConstantIndexOp,
+                arith::ConstantFloatOp, arith::ConstantIntOp>(def))
+          constValues.push_back(v);
+        else
+          argValues.emplace_back(v);
+      }
+
+      SmallVector<Type, 4> argTypes;
+      for (auto v : argValues)
+        argTypes.emplace_back(v.getType());
+      SmallVector<Type, 1> retTypes;
+      if (!forOp->use_empty())
+        retTypes.emplace_back(forOp.getResult(0).getType());
+      FunctionType type = FunctionType::get(context, argTypes, retTypes);
+      std::string kernelName =
+          entryPointFunc.getName().str() + "_operator_" + std::to_string(loopCount++);
+      builder.setInsertionPointToStart(&kernelModule.getBodyRegion().back());
+
+      auto gpuFunc =
+          builder.create<gpu::GPUFuncOp>(forOp.getLoc(), kernelName, type);
+      Block &newEntryBlock = gpuFunc.getBlocks().front();
+
+      gpuFunc->setAttr(
+          gpu::GPUDialect::getKernelFuncAttrName(), builder.getUnitAttr());
+
+      // clone forOp to newFunc.
+      IRMapping mapping;
+      // build mapping with argValues to newFunc arguments.
+      for (unsigned i = 0; i < argValues.size(); ++i) {
+        mapping.map(argValues[i], gpuFunc.getArgument(i));
+      }
+
+      OpBuilder forOpBuilder(context);
+      forOpBuilder.setInsertionPointToStart(&newEntryBlock);
+      // clone constValues to newEntryBlock.
+      for (auto v : constValues) {
+        Operation *def = v.getDefiningOp();
+        Operation *newOp = def->clone();
+        forOpBuilder.insert(newOp);
+        mapping.map(v, newOp->getResult(0));
+      }
+
+      Operation *newForOp = forOp->clone(mapping);
+      forOpBuilder.insert(newForOp);
+
+      clonedForOps.emplace_back(newForOp);
+      // Add ret value if forOp result is used.
+      if (!retTypes.empty())
+        forOpBuilder.create<gpu::ReturnOp>(
+            forOp.getLoc(), newForOp->getResult(0));
+
+      // Convert affine.for to gpu.globalID for cloned forOp.
+      auto converter =  convertAffineLoopNestToGPUGlobalID(cast<AffineForOp>(newForOp));
+      assert(converter && "fail to convert affine loop to gpu globalID");
+
+      {
+        spirv::EntryPointABIAttr entryPointInfo =
+            spirv::getEntryPointABIAttr(context, {(int)converter->GroupSize, 1, 1});
+
+        gpuFunc->setAttr(spirv::getEntryPointABIAttrName(), entryPointInfo);
+      }
+      // Replace forOp with gpu.launch.
+      builder.setInsertionPoint(forOp);
+
+      Location loc = gpuFunc->getLoc();
+      Value numGroup = builder.create<arith::ConstantIndexOp>(loc, converter->NumGroups);
+      Value groupSize = builder.create<arith::ConstantIndexOp>(loc, converter->GroupSize);
+
+      Value one =
+          builder.create<arith::ConstantIndexOp>(loc, 1);
+
+      gpu::KernelDim3 gridSize = {numGroup, one, one};
+      gpu::KernelDim3 blckSize = {groupSize, one, one};
+      Value none = TypedValue<::mlir::IntegerType>{};
+      Value SharedMemSize = none;
+      auto launchOp = builder.create<gpu::LaunchFuncOp>(forOp.getLoc(), gpuFunc,
+          gridSize, blckSize, SharedMemSize, argValues,
+          builder.getType<gpu::AsyncTokenType>());
+
+      // Replace forOp with gpu.launch.
+      if (!retTypes.empty()) {
+        for (unsigned i=0;i<forOp.getNumResults();++i)
+          forOp.getResult(i).replaceAllUsesWith(launchOp.getResult(i));
+      }
       forOp.erase();
+
+      lowerAffineLoadStoreToMemRefLoadStore(gpuFunc.getBody());
+      // Add gpu.return to gpuFunc.
+      builder.setInsertionPointToEnd(&gpuFunc.getBody().back());
+      builder.create<gpu::ReturnOp>(loc);
+
+      // Lower krnl.global into constant.
+      {
+        // auto globalOps = entryPointFunc.getOps<KrnlGlobalOp>();
+        //  collect all global ops.
+        SmallVector<KrnlGlobalOp, 4> globalOps;
+        gpuFunc.walk(
+            [&](KrnlGlobalOp globalOp) { globalOps.push_back(globalOp); });
+
+        for (auto globalOp : globalOps) {
+          OpBuilder builder(globalOp.getOperation());
+          Type type = globalOp.getType();
+          auto memRefTy = cast<MemRefType>(type);
+          auto eltTy = memRefTy.getElementType();
+          auto shapeTy = RankedTensorType::get(memRefTy.getShape(), eltTy);
+
+          Location loc = globalOp.getLoc();
+          DenseElementsAttr valueAttr = DenseElementsAttr::getFromRawBuffer(
+              shapeTy, getRawData(globalOp));
+
+          auto constantOp = builder.create<arith::ConstantOp>(loc, valueAttr);
+
+          auto alloc = builder.create<memref::AllocOp>(loc, memRefTy);
+          builder.create<memref::TensorStoreOp>(loc, constantOp, alloc);
+
+          globalOp.replaceAllUsesWith(alloc.getResult());
+          globalOp.erase();
+        }
+      }
+
+
     }
-
-    SmallVector<affine::AffineStoreOp, 4> stores;
-    entryPointFunc.getBody().walk(
-        [&](affine::AffineStoreOp forOp) { stores.push_back(forOp); });
-    for (auto store : stores) {
-      OpBuilder builder(store.getOperation());
-      auto memRefType = store.getMemRefType();
-      // Expand affine map from 'affineLoadOp'.
-      SmallVector<Value, 8> indices(store.getMapOperands());
-      auto maybeExpandedMap = affine::expandAffineMap(
-          builder, store.getLoc(), store.getAffineMap(), indices);
-      builder.create<memref::StoreOp>(store.getLoc(), store.getValueToStore(),
-          store.getMemRef(), *maybeExpandedMap);
-      store.erase();
-    }
   }
 
-  {
-    // unroll loop
-    // Store short loops as we walk.
-    SmallVector<affine::AffineForOp, 4> loops;
 
-    // Gathers all loops.
-    entryPointFunc.getBody().walk([&](affine::AffineForOp forOp) {
-        loops.push_back(forOp);
-    });
-    for (auto forOp : loops)
-      (void)affine::loopUnrollFull(forOp);
-  }
+  //{
+  //  // unroll loop
+  //  // Store short loops as we walk.
+  //  SmallVector<affine::AffineForOp, 4> loops;
 
-  {
-    // remove affine.yield
-    SmallVector<affine::AffineYieldOp, 4> yields;
-
-    // Gathers all loops.
-    entryPointFunc.getBody().walk(
-        [&](affine::AffineYieldOp forOp) { yields.push_back(forOp); });
-    for (auto forOp : yields)
-      forOp.erase();
-  }
+  //  // Gathers all loops.
+  //  entryPointFunc.getBody().walk([&](affine::AffineForOp forOp) {
+  //      loops.push_back(forOp);
+  //  });
+  //  for (auto forOp : loops)
+  //    (void)affine::loopUnrollFull(forOp);
+  //}
 
   auto numInputs =
       entryPointOp
@@ -452,13 +807,7 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
   
   }
 
-  // Create GPU module.
-  OpBuilder builder(context);
-  builder.setInsertionPointToStart(module.getBody());
-  auto kernelModule = builder.create<gpu::GPUModuleOp>(
-      entryPointFunc.getLoc(), Twine(entryPointFunc.getName(), "_GPU").str());
-
-  // Create GPU kernel function.
+  // Create new entry point function which has return type void.
   SmallVector<Type, 4> kernelOperandTypes;
   kernelOperandTypes.reserve(numInputs + numOutputs);
   for (Value operand : entryPointFunc.getArguments()) {
@@ -467,24 +816,14 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
   for (Type ty : entryPointFunc.getResultTypes()) {
     kernelOperandTypes.push_back(ty);
   }
-
   FunctionType type = FunctionType::get(context, kernelOperandTypes, {});
   StringRef kernelName = entryPointFunc.getName();
   entryPointFunc.setName("");
-  builder.setInsertionPointToStart(&kernelModule.getBodyRegion().front());
+  builder.setInsertionPointToStart(&module.getBodyRegion().back());
 
-  auto outlinedFunc = builder.create<gpu::GPUFuncOp>(entryPointFunc.getLoc(), kernelName, type);
-      //,
-      //TypeRange(ValueRange(launchOp.getWorkgroupAttributions())),
-      //TypeRange(ValueRange(launchOp.getPrivateAttributions())));
-  outlinedFunc->setAttr(
-      gpu::GPUDialect::getKernelFuncAttrName(), builder.getUnitAttr());
-  outlinedFunc.setName(kernelName);
-  //auto gpuModule = createGPUModule(module, entryPointFunc);
-
-  // Convert Krnl entry point to GPU entry point.
-  //auto gpuModule = convertKrnlEntryToGPUModule(module, EntryOp);
-
+  auto outlinedFunc =
+      builder.create<func::FuncOp>(entryPointFunc.getLoc(), kernelName, type);
+  outlinedFunc.addEntryBlock();
   // Remove krnl.entry_point.
   entryPointOp.erase();
 
@@ -495,57 +834,54 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
      arg.replaceAllUsesWith(newArg);
    }
 
-  // Move blocks of entryPointFunc to outlinedFunc.
-  auto &outlinedRegion = outlinedFunc.getFunctionBody();
-  outlinedRegion.getBlocks().splice(
-      outlinedRegion.end(), entryPointFunc.getBody().getBlocks());
-  
-  // merge entry block of outlinedFunc with next block.
-auto &entryBlock = outlinedRegion.front();
-    auto &nextBlock = *std::next(outlinedRegion.begin());
-entryBlock.getOperations().splice(entryBlock.end(),
-                                      nextBlock.getOperations());
-    nextBlock.dropAllReferences();
-nextBlock.erase();
+   // Move blocks of entryPointFunc to outlinedFunc.
+   auto &outlinedRegion = outlinedFunc.getFunctionBody();
+   outlinedRegion.getBlocks().splice(
+       outlinedRegion.end(), entryPointFunc.getBody().getBlocks());
 
-  // Find return op and remove it.
-auto returnOp = cast<func::ReturnOp>(outlinedFunc.getBody().back().getTerminator());
+   // merge entry block of outlinedFunc with next block.
+   auto &entryBlock = outlinedRegion.front();
+   auto &nextBlock = *std::next(outlinedRegion.begin());
+   entryBlock.getOperations().splice(
+       entryBlock.end(), nextBlock.getOperations());
+   nextBlock.dropAllReferences();
+   nextBlock.erase();
 
-  builder.setInsertionPoint(returnOp);
-  builder.create<gpu::ReturnOp>(returnOp.getLoc());
+   // Find return op and remove it.
+   auto returnOp =
+       cast<func::ReturnOp>(outlinedFunc.getBody().back().getTerminator());
 
-  for (int i = 0; i < numOutputs; ++i) {
-      // replace return value with outlinedFunc arguments.
-    auto retV = returnOp.getOperand(i);
-    auto outArg = outlinedFunc.getArgument(i + numInputs);
-retV.replaceAllUsesWith(outArg);
-  }
-    returnOp.erase();
+   builder.setInsertionPoint(returnOp);
+   builder.create<func::ReturnOp>(returnOp.getLoc());
 
-  entryPointFunc.erase();
-  
-  {
-spirv::EntryPointABIAttr entryPointInfo =
-    spirv::getEntryPointABIAttr(context, {64, 1, 1});
+   for (int i = 0; i < numOutputs; ++i) {
+     // replace return value with outlinedFunc arguments.
+     auto retV = returnOp.getOperand(i);
+     auto outArg = outlinedFunc.getArgument(i + numInputs);
+     retV.replaceAllUsesWith(outArg);
+   }
+   returnOp.erase();
 
-outlinedFunc->setAttr(spirv::getEntryPointABIAttrName(), entryPointInfo);
-  }
+   entryPointFunc.erase();
 
-  spirv::TargetEnvAttr targetAttr = spirv::lookupTargetEnvOrDefault(module);
+   spirv::TargetEnvAttr targetAttr = spirv::lookupTargetEnvOrDefault(module);
 
-  // Add SPV_KHR_storage_buffer_storage_class, SPV_KHR_variable_pointers to
-  // targetAttr.
-  auto triple = spirv::VerCapExtAttr::get(spirv::Version::V_1_3,
-      {spirv::Capability::Shader},
-      {spirv::Extension::SPV_KHR_storage_buffer_storage_class,
-          spirv::Extension::SPV_KHR_variable_pointers},
-      context);
-  targetAttr = spirv::TargetEnvAttr::get(triple,
-      spirv::getDefaultResourceLimits(context), spirv::ClientAPI::Unknown,
-      spirv::Vendor::Unknown, spirv::DeviceType::Unknown,
-      spirv::TargetEnvAttr::kUnknownDeviceID);
+   // Add SPV_KHR_storage_buffer_storage_class, SPV_KHR_variable_pointers to
+   // targetAttr.
+   auto triple = spirv::VerCapExtAttr::get(spirv::Version::V_1_3,
+       {spirv::Capability::Shader},
+       {spirv::Extension::SPV_KHR_storage_buffer_storage_class,
+           spirv::Extension::SPV_KHR_variable_pointers},
+       context);
+   targetAttr = spirv::TargetEnvAttr::get(triple,
+       spirv::getDefaultResourceLimits(context), spirv::ClientAPI::Unknown,
+       spirv::Vendor::Unknown, spirv::DeviceType::Unknown,
+       spirv::TargetEnvAttr::kUnknownDeviceID);
 
-  module->setAttr(spirv::getTargetEnvAttrName(), targetAttr);
+   module->setAttr(spirv::getTargetEnvAttrName(), targetAttr);
+   // required by gpu.launchFuncOp.
+   module->setAttr(
+       gpu::GPUDialect::getContainerModuleAttrName(), builder.getUnitAttr());
 }
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
