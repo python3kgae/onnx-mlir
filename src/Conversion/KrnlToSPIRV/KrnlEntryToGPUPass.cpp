@@ -595,6 +595,8 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
     entryPointFunc.walk(
         [&](KrnlGlobalOp globalOp) { globalOps.push_back(globalOp); });
 
+    OpBuilder globalBuilder(entryPointFunc.getOperation());
+    int globalID = 0;
     for (auto globalOp : globalOps) {
       OpBuilder builder(globalOp.getOperation());
       Type type = globalOp.getType();
@@ -608,15 +610,25 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
 
       auto constantOp = builder.create<arith::ConstantOp>(loc, valueAttr);
 
-      auto alloc = builder.create<memref::AllocOp>(loc, memRefTy);
-      builder.create<memref::TensorStoreOp>(loc, constantOp, alloc);
+      {
+        std::string name = "krnl_global_" + std::to_string(globalID++);
+        auto memrefGlobal = globalBuilder.create<memref::GlobalOp>(loc, name,
 
-      globalOp.replaceAllUsesWith(alloc.getResult());
+            /*sym_visibility=*/globalBuilder.getStringAttr("private"),
+            /*type=*/memRefTy,
+            /*initial_value=*/valueAttr,
+            /*constant=*/false, // Set false to allow the value to be changed by
+                                // runOnVulkan which call
+                                // updateHostMemoryBuffers for all buffers.
+            /*alignment=*/globalBuilder.getI64IntegerAttr(8));
+        auto getGlobalOp =
+            builder.create<memref::GetGlobalOp>(loc, memRefTy, name);
+        globalOp.replaceAllUsesWith(getGlobalOp.getResult());
+      }
+
       globalOp.erase();
     }
   }
-
-
 
   // Create GPU module.
   OpBuilder builder(context);
@@ -661,12 +673,33 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
           argValues.emplace_back(v);
       }
 
+      // Reshape memref types if rank > 3 because vulkan not support it.
+      auto reshapeMemRefType = [](Type ty)-> Type {
+        MemRefType memRefTy = ty.dyn_cast<MemRefType>();
+        if (!memRefTy)
+          return ty;
+        if (!memRefTy.hasRank())
+          return memRefTy;
+        unsigned rank = memRefTy.getRank();
+        if (rank <= 3)
+          return memRefTy;
+
+        SmallVector<int64_t, 4> shape;
+        shape.push_back(1);
+        for (int i = 0; i < memRefTy.getRank(); ++i) {
+          shape[0] = shape[0] * memRefTy.getShape()[i];
+        }
+        auto newMemRefTy = MemRefType::get(shape, memRefTy.getElementType());
+        return newMemRefTy;
+      };
+
       SmallVector<Type, 4> argTypes;
       for (auto v : argValues)
-        argTypes.emplace_back(v.getType());
+        argTypes.emplace_back(reshapeMemRefType(v.getType()));
       SmallVector<Type, 1> retTypes;
       if (!forOp->use_empty())
-        retTypes.emplace_back(forOp.getResult(0).getType());
+        retTypes.emplace_back(reshapeMemRefType(forOp.getResult(0).getType()));
+
       FunctionType type = FunctionType::get(context, argTypes, retTypes);
       std::string kernelName =
           entryPointFunc.getName().str() + "_operator_" + std::to_string(loopCount++);
@@ -679,15 +712,52 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
       gpuFunc->setAttr(
           gpu::GPUDialect::getKernelFuncAttrName(), builder.getUnitAttr());
 
+      OpBuilder forOpBuilder(context);
+      forOpBuilder.setInsertionPointToStart(&newEntryBlock);
+
+      auto reinterPretShapeMemRefV = [](OpBuilder &builder, Location Loc,
+                                    Type targetTy, Value V) -> Value {
+        Value result = V;
+        if (V.getType() != targetTy) {
+          auto memRefTy = targetTy.cast<MemRefType>();
+          auto shape = memRefTy.getShape();
+          SmallVector<int64_t, 4> sizes;
+          for (auto dim : shape) {
+            sizes.push_back(dim);
+          }
+          SmallVector<int64_t, 4> rev_strides;
+          rev_strides.push_back(1);
+          for (int i = sizes.size() - 1; i > 0; --i) {
+            rev_strides.push_back(rev_strides.back() * sizes[i]);
+          }
+          SmallVector<int64_t, 4> strides(rev_strides.rbegin(), rev_strides.rend());
+          SmallVector<OpFoldResult> sizesFold;
+          for (auto s : sizes) {
+                sizesFold.push_back(builder.getIndexAttr(s));
+            }
+          SmallVector<OpFoldResult> stridesFold;
+          for (auto s : strides) {
+                    stridesFold.push_back(builder.getIndexAttr(s));
+                }
+          result = builder.create<memref::ReinterpretCastOp>(Loc, memRefTy, V,
+              builder.getIndexAttr(0), sizesFold, stridesFold);
+        }
+        return result;
+      };
+
       // clone forOp to newFunc.
       IRMapping mapping;
       // build mapping with argValues to newFunc arguments.
       for (unsigned i = 0; i < argValues.size(); ++i) {
-        mapping.map(argValues[i], gpuFunc.getArgument(i));
+        auto argV = argValues[i];
+        Value newArgV = gpuFunc.getArgument(i);
+        // reshape when type not match on memref type.
+        newArgV = reinterPretShapeMemRefV(
+            forOpBuilder, forOp.getLoc(), argV.getType(),
+                       newArgV);
+        mapping.map(argV, newArgV);
       }
 
-      OpBuilder forOpBuilder(context);
-      forOpBuilder.setInsertionPointToStart(&newEntryBlock);
       // clone constValues to newEntryBlock.
       for (auto v : constValues) {
         Operation *def = v.getDefiningOp();
@@ -701,9 +771,13 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
 
       clonedForOps.emplace_back(newForOp);
       // Add ret value if forOp result is used.
-      if (!retTypes.empty())
-        forOpBuilder.create<gpu::ReturnOp>(
-            forOp.getLoc(), newForOp->getResult(0));
+      if (!retTypes.empty()) {
+        Value retValue = newForOp->getResult(0);
+        retValue = reinterPretShapeMemRefV(
+            forOpBuilder, forOp.getLoc(), retTypes[0],
+                       retValue);
+        forOpBuilder.create<gpu::ReturnOp>(forOp.getLoc(), retValue);
+      }
 
       // Convert affine.for to gpu.globalID for cloned forOp.
       auto converter =  convertAffineLoopNestToGPUGlobalID(cast<AffineForOp>(newForOp));
@@ -729,14 +803,30 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
       gpu::KernelDim3 blckSize = {groupSize, one, one};
       Value none = TypedValue<::mlir::IntegerType>{};
       Value SharedMemSize = none;
+      // reshape argValues to newFunc arguments.
+      for (unsigned i = 0; i < argValues.size(); ++i) {
+        Value argV = argValues[i];
+        Value newArgV = gpuFunc.getArgument(i);
+        // reshape when type not match on memref type.
+        argV = reinterPretShapeMemRefV(
+            builder, forOp.getLoc(), newArgV.getType(),
+                                  argV);
+        argValues[i] = argV;
+      }
       auto launchOp = builder.create<gpu::LaunchFuncOp>(forOp.getLoc(), gpuFunc,
           gridSize, blckSize, SharedMemSize, argValues,
           builder.getType<gpu::AsyncTokenType>());
 
       // Replace forOp with gpu.launch.
       if (!retTypes.empty()) {
-        for (unsigned i=0;i<forOp.getNumResults();++i)
-          forOp.getResult(i).replaceAllUsesWith(launchOp.getResult(i));
+        for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
+          auto retV = forOp.getResult(i);
+          auto newRetV = launchOp.getResult(i);
+          newRetV = reinterPretShapeMemRefV(
+              builder, forOp.getLoc(), retV.getType(),
+                                                newRetV);
+          retV.replaceAllUsesWith(newRetV);
+        }
       }
       forOp.erase();
 
@@ -744,37 +834,6 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
       // Add gpu.return to gpuFunc.
       builder.setInsertionPointToEnd(&gpuFunc.getBody().back());
       builder.create<gpu::ReturnOp>(loc);
-
-      // Lower krnl.global into constant.
-      {
-        // auto globalOps = entryPointFunc.getOps<KrnlGlobalOp>();
-        //  collect all global ops.
-        SmallVector<KrnlGlobalOp, 4> globalOps;
-        gpuFunc.walk(
-            [&](KrnlGlobalOp globalOp) { globalOps.push_back(globalOp); });
-
-        for (auto globalOp : globalOps) {
-          OpBuilder builder(globalOp.getOperation());
-          Type type = globalOp.getType();
-          auto memRefTy = cast<MemRefType>(type);
-          auto eltTy = memRefTy.getElementType();
-          auto shapeTy = RankedTensorType::get(memRefTy.getShape(), eltTy);
-
-          Location loc = globalOp.getLoc();
-          DenseElementsAttr valueAttr = DenseElementsAttr::getFromRawBuffer(
-              shapeTy, getRawData(globalOp));
-
-          auto constantOp = builder.create<arith::ConstantOp>(loc, valueAttr);
-
-          auto alloc = builder.create<memref::AllocOp>(loc, memRefTy);
-          builder.create<memref::TensorStoreOp>(loc, constantOp, alloc);
-
-          globalOp.replaceAllUsesWith(alloc.getResult());
-          globalOp.erase();
-        }
-      }
-
-
     }
   }
 
