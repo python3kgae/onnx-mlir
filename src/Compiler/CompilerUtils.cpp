@@ -321,6 +321,12 @@ std::string getTargetFilename(
     return filenameNoExt + ".jar";
   case EmitSPIRV:
     return filenameNoExt + ".spirv.mlir";
+  case EmitSPIRVRunner:
+#ifdef _WIN32
+    return filenameNoExt + ".spirv.dll";
+#else
+    return filenameNoExt + ".spirv.so";
+#endif
   case EmitLLVMIR:
   case EmitONNXBasic:
   case EmitONNXIR:
@@ -780,6 +786,21 @@ static int emitOutputFiles(std::string outputNameNoExt,
     if (VerboseOutput)
       printf(
           "%s.spv has been generated.\n", outputNameNoExt.c_str());
+  } break;
+  case EmitSPIRVRunner: {
+    std::string sharedLibNameWithExt;
+    int rc = compileModuleToSharedLibrary(
+        module, outputNameNoExt, sharedLibNameWithExt);
+    if (rc != CompilerSuccess)
+      return rc;
+    if (keepFiles(KeepFilesOfType::MLIR)) {
+      rc = outputCode(module, outputNameNoExt + ".spv.runner.mlir");
+      if (rc != CompilerSuccess)
+        return rc;
+    }
+    if (VerboseOutput)
+      printf("Shared library %s has been compiled.\n",
+          sharedLibNameWithExt.c_str());
   } break;
   default: {
     // Emit the version with all constants included.

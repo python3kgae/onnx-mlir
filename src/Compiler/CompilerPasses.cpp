@@ -24,6 +24,7 @@
 #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/Bufferization/Pipelines/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/LLVMIR/Transforms/RequestCWrappers.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
@@ -278,6 +279,41 @@ void addKrnlToSPIRVPasses(
   return;
 }
 
+void addKrnlToSPIRVRunnerPasses(
+    mlir::OwningOpRef<ModuleOp> &module,
+    mlir::OpPassManager &pm, std::string outputNameNoExt, bool enableCSE) {
+  if (enableCSE)
+    // Eliminate common sub-expressions before lowering to Krnl.
+    // TODO: enable this by default when we make sure it works flawlessly.
+    pm.addPass(mlir::createCSEPass());
+  pm.addNestedPass<func::FuncOp>(mlir::createConvertVectorToSCFPass());
+  // pm.addNestedPass<func::FuncOp>(mlir::createAffineForToGPUPass());
+
+  pm.addPass(onnx_mlir::krnl::createConvertKrnlEntryToGPUPass());
+
+  pm.addPass(mlir::createMem2Reg());
+  pm.addPass(mlir::createLowerAffinePass());
+  pm.addPass(mlir::createConvertGPUToSPIRVPass());
+
+  OpPassManager &modulePM = pm.nest<spirv::ModuleOp>();
+  modulePM.addPass(mlir::spirv::createSPIRVLowerABIAttributesPass());
+  modulePM.addPass(mlir::spirv::createSPIRVUpdateVCEPass());
+
+  pm.addPass(createConvertGpuLaunchFuncToVulkanLaunchFuncPass());
+  pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+  pm.addPass(createConvertVectorToLLVMPass());
+  pm.nest<func::FuncOp>().addPass(LLVM::createRequestCWrappersPass());
+  ConvertFuncToLLVMPassOptions funcToLLVMOptions{};
+  funcToLLVMOptions.indexBitwidth =
+      DataLayout(*module).getTypeSizeInBits(IndexType::get(module->getContext()));
+  pm.addPass(createConvertFuncToLLVMPass(funcToLLVMOptions));
+ // pm.addPass(createRemoveDeadValuesPass());
+  pm.addPass(createReconcileUnrealizedCastsPass());
+  pm.addPass(createConvertVulkanLaunchFuncToVulkanCallsPass());
+
+  return;
+}
+
 InputIRLevelType determineInputIRLevel(mlir::OwningOpRef<ModuleOp> &module) {
   Operation *moduleOp = module->getOperation();
 
@@ -322,6 +358,10 @@ void addPasses(mlir::OwningOpRef<ModuleOp> &module, mlir::PassManager &pm,
 
   if (emissionTarget == EmitSPIRV) {
     addKrnlToSPIRVPasses(pm, outputNameNoExt, /*enableCSE=*/true);
+    return;
+  }
+  if (emissionTarget == EmitSPIRVRunner) {
+    addKrnlToSPIRVRunnerPasses(module, pm, outputNameNoExt, /*enableCSE=*/true);
     return;
   }
 

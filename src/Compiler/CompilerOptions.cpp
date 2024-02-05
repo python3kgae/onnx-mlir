@@ -215,6 +215,7 @@ static llvm::cl::opt<EmissionTargetType, true> emissionTargetOpt(
         clEnumVal(
             EmitLLVMIR, "Lower the input to LLVM IR (LLVM MLIR dialect)."),
         clEnumVal(EmitSPIRV, "Lower the input to SPIRV (SPIRV MLIR dialect)."),
+        clEnumVal(EmitSPIRVRunner, "Lower the input to binary runs SPIRV."),
         clEnumVal(EmitObj, "Compile the input into a object file."),
         clEnumVal(
             EmitLib, "Compile the input into a shared library (default)."),
