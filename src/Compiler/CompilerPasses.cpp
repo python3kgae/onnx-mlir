@@ -19,6 +19,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Conversion/MathToSPIRV/MathToSPIRVPass.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
@@ -270,6 +271,7 @@ void addKrnlToSPIRVPasses(
 
   pm.addPass(mlir::createMem2Reg());
   pm.addPass(mlir::createLowerAffinePass());
+  pm.addPass(createConvertMathToSPIRVPass());
   pm.addPass(mlir::createConvertGPUToSPIRVPass());
 
   OpPassManager &modulePM = pm.nest<spirv::ModuleOp>();
@@ -293,6 +295,7 @@ void addKrnlToSPIRVRunnerPasses(
 
   pm.addPass(mlir::createMem2Reg());
   pm.addPass(mlir::createLowerAffinePass());
+  pm.addPass(createConvertMathToSPIRVPass());
   pm.addPass(mlir::createConvertGPUToSPIRVPass());
 
   OpPassManager &modulePM = pm.nest<spirv::ModuleOp>();
