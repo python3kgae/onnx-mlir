@@ -405,7 +405,7 @@ static void lowerIterateOp(KrnlIterateOp &iterateOp, OpBuilder &builder,
         llvm::cast<AffineForOp>(currentNestedForOps.back().second)
             .getBody()
             ->begin());
-
+    inits = ValueRange(forOp.getRegionIterArgs());
     //inits = forOp.getRegionIterArgs();
     affineLoops.push_back(forOp);
   }
@@ -445,18 +445,24 @@ static void lowerIterateOp(KrnlIterateOp &iterateOp, OpBuilder &builder,
 
     if (!iterateOp.use_empty()) {
       // find the outter affine.for op.
-      auto outterForOp = cast<AffineForOp>(parentBlock->getParentOp());
-
-      // replace use of iterateOp result with outter affine.for result.
-      for (auto [result, newResult] :
-          llvm::zip(iterateOp.getResults(), outterForOp.getResults())) {
-        result.replaceAllUsesWith(newResult);
+      auto outterForOp = dyn_cast<AffineForOp>(parentBlock->getParentOp());
+      while (!outterForOp) {
+        parentBlock = parentBlock->getParentOp()->getBlock();
+        outterForOp = dyn_cast<AffineForOp>(parentBlock->getParentOp());
       }
-      // replace region iterArgs with outter affine.for region iterArgs.
-      for (auto [iterArg, newIterArg] : llvm::zip(iterateOp.getRegionIterArgs(),
-               outterForOp.getRegionIterArgs())) {
-            iterArg.replaceAllUsesWith(newIterArg);
+      if (outterForOp) {
+        // replace use of iterateOp result with outter affine.for result.
+        for (auto [result, newResult] :
+            llvm::zip(iterateOp.getResults(), outterForOp.getResults())) {
+          result.replaceAllUsesWith(newResult);
         }
+        // replace region iterArgs with outter affine.for region iterArgs.
+        for (auto [iterArg, newIterArg] :
+            llvm::zip(iterateOp.getRegionIterArgs(),
+                outterForOp.getRegionIterArgs())) {
+          iterArg.replaceAllUsesWith(newIterArg);
+        }
+      }
     }
     // Transfer body region operations to parent region, without the terminator
     // op.

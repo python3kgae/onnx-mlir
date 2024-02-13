@@ -159,12 +159,7 @@ SmallVector<AffineForOp, 4> collectAffineLoopNestBounds(AffineForOp forOp) {
 
   while (true) {
     if (!currentLoop.hasConstantBounds())
-              break;
-    auto lb = currentLoop.getConstantLowerBound();
-    auto ub = currentLoop.getConstantUpperBound();
-    auto step = currentLoop.getStep();
-    lb++;
-    ub++;
+      break;
 
     if (currentLoop.getBody()->getOperations().size() != 2) {
       loops.push_back(currentLoop);
@@ -173,6 +168,35 @@ SmallVector<AffineForOp, 4> collectAffineLoopNestBounds(AffineForOp forOp) {
 
     if (!isa<AffineYieldOp>(&currentLoop.getBody()->back()))
       break;
+
+    // For case like this, each iterate dependents on the previous one.
+    // So cannot parallelize.
+    //%8 = affine.for %arg1 = 0 to 3 iter_args(%arg2 = %cst_0) -> (f32) {
+    //  %9 = affine.for %arg3 = 0 to 10 iter_args(%arg4 = %arg2) -> (f32) {
+    //    %10 = affine.for %arg5 = 0 to 256 iter_args(%arg6 = %arg4) -> (f32) {
+    //      %13 = affine.load %reinterpret_cast[%arg1, %arg5] :
+    //      memref<1x256xf32> %14 = affine.load %2[%arg5, %arg3] :
+    //      memref<256x10xf32> %15 = arith.mulf %13, %14 : f32 %16 = arith.addf
+    //      %15, %arg6 : f32 affine.yield %16 : f32
+    //    }
+    //    %11 = affine.load %5[%c0, %arg3] : memref<1x10xf32>
+    //    %12 = arith.addf %10, %11 : f32
+    //    affine.store %12, %alloc_6[%arg1, %arg3] : memref<1x10xf32>
+    //    affine.yield %10 : f32
+    //  }
+    //  affine.yield %9 : f32
+    //}
+    bool hasNonConstantInit = false;
+    for (auto init : currentLoop.getInits()) {
+      if (!init.getDefiningOp<arith::ConstantOp>()) {
+        hasNonConstantInit = true;
+        break;
+      }
+    }
+    if (hasNonConstantInit) {
+      loops.pop_back();
+      break;
+    }
 
     if (auto nestForOp =
             dyn_cast<AffineForOp>(&currentLoop.getBody()->front())) {
@@ -377,8 +401,14 @@ std::optional<AffineLoopToGpuConverter> convertAffineLoopNestToGPUGlobalID(
     AffineForOp forOp, unsigned numBlockDims = 1, unsigned numThreadDims = 1) {
   auto loops = collectAffineLoopNestBounds(forOp);
   // No top level loops.
-  if (loops.empty())
-    return std::nullopt;
+  if (loops.empty()) {
+    // Just leave the loop as is.
+    // Run it in a single thread.
+    AffineLoopToGpuConverter converter;
+    converter.NumGroups = 1;
+    converter.GroupSize = 1;
+    return converter;
+  }
 
   // Translate the loop nest to a GPU kernel in 1D.
   // 1D is easier to handle, the cost is extra instruction to compute the index
@@ -660,6 +690,11 @@ void ConvertKrnlEntryToGPUPass::runOnOperation() {
       // collect used values which defined outside of affine.for.
       llvm::SetVector<Value> usedValues;
       mlir::getUsedValuesDefinedAbove(forOp.getBodyRegion(), usedValues);
+      // Add inits to usedValues.
+      for (auto init : forOp.getInits()) {
+        usedValues.insert(init);
+      }
+
       llvm::SmallVector<Value, 4> constValues;
       llvm::SmallVector<Value, 4> argValues;
       for (auto v : usedValues) {
