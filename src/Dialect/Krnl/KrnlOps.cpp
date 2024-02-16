@@ -351,8 +351,23 @@ void KrnlIterateOp::print(OpAsmPrinter &printer) {
   }
 
   printer << ")";
+
+  if (getNumIterArgs()) {
+
+    auto iterArgs = Block::BlockArgListType(
+        entryBBArgs.begin() + numInductionVars, entryBBArgs.end());
+    // iter_args(% sum_iter = % sum_0)
+    printer << " iter_args(";
+    for (auto it : llvm::zip(iterArgs, getIterArgInits())) {
+      printer.printOperand(std::get<0>(it));
+      printer << " = ";
+      printer.printOperand(std::get<1>(it));
+    }
+    printer << ")";
+  }
+
   printer.printRegion(getBodyRegion(), /*printEntryBlockArgs=*/false,
-      /*printBlockTerminators=*/false);
+      /*printBlockTerminators=*/true);
 }
 
 //===----------------------------------------------------------------------===//
